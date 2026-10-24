@@ -4,9 +4,10 @@
 //! **every step** (tableaus, ratio tests, pivots, phase changes) as plain data, so a teaching
 //! tool or UI can replay the method exactly as it is done by hand.
 //!
-//! Supported methods: primal simplex, Big-M (with a symbolic `M`) and two-phase.
-//! All variables are non-negative. Every optimal solution includes a [`Sensitivity`] analysis:
-//! shadow prices, reduced costs and ranges.
+//! Supported methods: primal simplex, Big-M (with a symbolic `M`), two-phase and dual simplex.
+//! All variables are non-negative. Every optimal solution includes a [`Sensitivity`] analysis
+//! (shadow prices, reduced costs and ranges), and [`reoptimize`] repairs it with dual simplex
+//! pivots after constraints are added, instead of solving again.
 //!
 //! With the **`serde`** feature, [`Problem`], [`Solution`], [`Trace`] and every [`Step`] can be
 //! (de)serialized, e.g. to JSON for a web front end. Numbers are exact strings such as `"3/2"`.
@@ -47,8 +48,8 @@ pub use error::Error;
 pub use num::{Coef, IntoRational, Rational, ratio};
 pub use problem::{Constraint, Problem, Relation, Sense};
 pub use sensitivity::{ConstraintSensitivity, Interval, Sensitivity, Source, VariableSensitivity};
-pub use solver::{Method, Options, PivotRule, Solution, Status, solve};
-pub use trace::{NamedValue, Phase, RatioTest, Snapshot, Step, Termination, Trace};
+pub use solver::{Method, Options, PivotRule, Solution, Status, reoptimize, solve};
+pub use trace::{DualRatioTest, NamedValue, Phase, RatioTest, Snapshot, Step, Termination, Trace};
 
 // Compile the Rust examples of the README as doctests, so it cannot drift from the API.
 #[cfg(doctest)]

@@ -1,5 +1,7 @@
 use std::fmt;
 
+use num_traits::Signed;
+
 use crate::num::{Coef, Rational};
 use crate::problem::Sense;
 
@@ -17,6 +19,8 @@ pub enum Phase {
     One,
     /// Two-phase method, phase 2: optimize the real objective.
     Two,
+    /// Dual simplex: restore feasibility while keeping the objective row optimal.
+    Dual,
 }
 
 impl fmt::Display for Phase {
@@ -25,6 +29,7 @@ impl fmt::Display for Phase {
             Phase::Single => write!(f, "simplex"),
             Phase::One => write!(f, "phase 1"),
             Phase::Two => write!(f, "phase 2"),
+            Phase::Dual => write!(f, "dual simplex"),
         }
     }
 }
@@ -70,6 +75,13 @@ impl Snapshot {
             Sense::Minimize => !self.z.iter().any(Coef::is_positive),
         }
     }
+
+    /// `true` when every right-hand side is `>= 0`. Primal methods keep this at every
+    /// iteration; the dual simplex works towards it, so its intermediate tableaus are
+    /// optimal but not feasible.
+    pub fn is_feasible(&self) -> bool {
+        !self.rhs.iter().any(Signed::is_negative)
+    }
 }
 
 /// One entry of the minimum-ratio test.
@@ -79,6 +91,17 @@ impl Snapshot {
 pub struct RatioTest {
     pub row: usize,
     /// `rhs / pivot-column entry`, or `None` when the entry is `<= 0` (row not eligible).
+    #[cfg_attr(feature = "serde", serde(with = "crate::serde_rational::option"))]
+    pub ratio: Option<Rational>,
+}
+
+/// One entry of the dual simplex ratio test, which runs over the columns of the leaving row.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DualRatioTest {
+    pub column: usize,
+    /// `|z_j - c_j| / |a_rj|`, or `None` when the entry `a_rj` is `>= 0` (column not eligible).
     #[cfg_attr(feature = "serde", serde(with = "crate::serde_rational::option"))]
     pub ratio: Option<Rational>,
 }
@@ -166,6 +189,39 @@ pub enum Step {
         artificials: Vec<NamedValue>,
         unbounded_direction: bool,
     },
+    /// A dual simplex pivot: which row leaves (it has a negative right-hand side), which
+    /// column enters, and the ratio test over the columns behind the choice.
+    #[non_exhaustive]
+    DualPivot {
+        phase: Phase,
+        iteration: usize,
+        leaving_row: usize,
+        leaving: usize,
+        leaving_name: String,
+        entering: usize,
+        entering_name: String,
+        #[cfg_attr(feature = "serde", serde(with = "crate::serde_rational::one"))]
+        pivot_value: Rational,
+        ratios: Vec<DualRatioTest>,
+    },
+    /// Dual simplex: the leaving row has a negative right-hand side but no negative entry, so
+    /// its equation (non-negative terms adding up to a negative number) cannot hold: the
+    /// problem is infeasible.
+    #[non_exhaustive]
+    InfeasibleRow {
+        row: usize,
+        /// The basic variable of that row and its (negative) value.
+        basic: NamedValue,
+    },
+    /// [`reoptimize`](crate::reoptimize): constraint `constraint` of the extended problem was
+    /// appended to the final tableau as row `row`, expressed in the current basis with its
+    /// own slack basic. `satisfied` tells whether the previous optimum already meets it.
+    #[non_exhaustive]
+    ConstraintAdded {
+        constraint: usize,
+        row: usize,
+        satisfied: bool,
+    },
     /// Final outcome.
     #[non_exhaustive]
     Finished { termination: Termination },
@@ -196,7 +252,12 @@ impl Trace {
     pub fn pivot_count(&self) -> usize {
         self.steps
             .iter()
-            .filter(|s| matches!(s, Step::Pivot { .. } | Step::ArtificialPivotedOut { .. }))
+            .filter(|s| {
+                matches!(
+                    s,
+                    Step::Pivot { .. } | Step::DualPivot { .. } | Step::ArtificialPivotedOut { .. }
+                )
+            })
             .count()
     }
 
@@ -278,6 +339,8 @@ pub(crate) fn write_table(f: &mut fmt::Formatter<'_>, table: &[Vec<String>]) -> 
 
 impl fmt::Display for Trace {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Column names of the latest tableau, to label the dual ratio test.
+        let mut columns: &[String] = &[];
         for step in &self.steps {
             match step {
                 Step::Tableau {
@@ -285,6 +348,7 @@ impl fmt::Display for Trace {
                     iteration,
                     snapshot,
                 } => {
+                    columns = &snapshot.columns;
                     writeln!(f, "== {phase}, iteration {iteration} ==")?;
                     write!(f, "{snapshot}")?;
                 }
@@ -353,6 +417,50 @@ impl fmt::Display for Trace {
                         } else {
                             format!("{} are", list.join(", "))
                         }
+                    )?;
+                }
+                Step::DualPivot {
+                    leaving_name,
+                    leaving_row,
+                    entering_name,
+                    pivot_value,
+                    ratios,
+                    ..
+                } => {
+                    let tests: Vec<String> = ratios
+                        .iter()
+                        .filter_map(|r| r.ratio.as_ref().map(|v| (r.column, v)))
+                        .map(|(j, v)| {
+                            format!("{}: {v}", columns.get(j).map_or("?", String::as_str))
+                        })
+                        .collect();
+                    writeln!(
+                        f,
+                        "-> {leaving_name} leaves (row {}), {entering_name} enters (pivot {pivot_value}); ratios [{}]",
+                        leaving_row + 1,
+                        tests.join(", ")
+                    )?;
+                }
+                Step::InfeasibleRow { row, basic } => {
+                    writeln!(
+                        f,
+                        "-> row {} has {} = {} but no negative entry: no feasible solution",
+                        row + 1,
+                        basic.name,
+                        basic.value
+                    )?;
+                }
+                Step::ConstraintAdded {
+                    constraint,
+                    row,
+                    satisfied,
+                } => {
+                    writeln!(
+                        f,
+                        "-> constraint {} added as row {} ({} by the current solution)",
+                        constraint + 1,
+                        row + 1,
+                        if *satisfied { "satisfied" } else { "violated" }
                     )?;
                 }
                 Step::Finished { termination } => writeln!(f, "== {termination:?} ==")?,

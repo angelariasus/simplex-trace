@@ -97,11 +97,16 @@ fn documented_problem_json_solves() {
 
 #[test]
 fn status_format() {
-    // The status is flattened into the solution object, next to `sensitivity` and `trace`.
+    // The status is flattened into the solution object, next to `problem`, `sensitivity`
+    // and `trace`.
     let without_trace = |solution: &Solution| {
         let mut value = to_value(solution);
         let object = value.as_object_mut().unwrap();
         object.remove("trace").unwrap();
+        assert_eq!(
+            object.remove("problem").unwrap(),
+            serde_json::to_value(&solution.problem).unwrap()
+        );
         // Present exactly when optimal.
         assert_eq!(
             object.remove("sensitivity").is_some(),

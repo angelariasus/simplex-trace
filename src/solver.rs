@@ -4,7 +4,9 @@ use crate::error::Error;
 use crate::num::{Coef, Rational};
 use crate::problem::{Problem, Relation, Sense};
 use crate::sensitivity::{self, Cells, Sensitivity, StandardForm};
-use crate::trace::{NamedValue, Phase, RatioTest, Snapshot, Step, Termination, Trace};
+use crate::trace::{
+    DualRatioTest, NamedValue, Phase, RatioTest, Snapshot, Step, Termination, Trace,
+};
 
 /// Which variant of the simplex method to run.
 ///
@@ -21,6 +23,12 @@ pub enum Method {
     BigM,
     /// Two-phase method. Falls back to a single phase when no artificial variable is needed.
     TwoPhase,
+    /// Dual simplex. Every constraint is written as `<=` (a `>=` is multiplied by `-1`), so
+    /// the slacks give a starting basis that may be infeasible (negative right-hand sides)
+    /// but must be dual feasible: non-negative costs when minimizing, non-positive when
+    /// maximizing, and no equality constraints. Otherwise
+    /// [`Error::NotDualFeasible`](crate::Error::NotDualFeasible) is returned.
+    DualSimplex,
 }
 
 /// Rule for choosing the entering column.
@@ -30,9 +38,11 @@ pub enum Method {
 #[non_exhaustive]
 pub enum PivotRule {
     /// The textbook rule: the most negative `z_j - c_j` when maximizing, the most positive
-    /// when minimizing. Ties go to the lowest column index.
+    /// when minimizing. Ties go to the lowest column index. In the dual simplex, the row with
+    /// the most negative right-hand side leaves.
     Dantzig,
-    /// The lowest-index column that improves the objective. Slower, but never cycles.
+    /// The lowest-index column that improves the objective. Slower, but never cycles. In the
+    /// dual simplex, the negative row whose basic variable has the lowest index leaves.
     Bland,
 }
 
@@ -94,16 +104,20 @@ pub enum Status {
     Unbounded,
 }
 
-/// The status, the sensitivity analysis (when optimal) and the full step-by-step trace.
+/// The status, the problem that was solved, the sensitivity analysis (when optimal) and the
+/// full step-by-step trace.
 ///
 /// With the `serde` feature the status fields sit at the top level:
-/// `{"status": "optimal", "objective": "17/5", "values": [...], "sensitivity": {...}, "trace": {...}}`.
+/// `{"status": "optimal", "objective": "17/5", "values": [...], "problem": {...},
+/// "sensitivity": {...}, "trace": {...}}`.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Solution {
     #[cfg_attr(feature = "serde", serde(flatten))]
     pub status: Status,
+    /// The problem this solution answers, so that [`reoptimize`] can extend it.
+    pub problem: Problem,
     /// Shadow prices, reduced costs and ranges, computed for every optimal solution.
     ///
     /// `None` exactly when the status is not optimal.
@@ -135,11 +149,19 @@ pub struct Solution {
 pub fn solve(problem: &Problem, method: Method, options: &Options) -> Result<Solution, Error> {
     problem.validate()?;
     let mut trace = Trace::new(problem.sense);
-    let mut t = Tableau::standard_form(problem);
     let sense = problem.sense;
     let costs = &problem.objective;
 
-    let status = match method {
+    if method == Method::DualSimplex {
+        check_dual_feasible(problem)?;
+        let mut t = Tableau::dual_form(problem);
+        t.set_objective(sense, "z", costs, &Coef::zero());
+        let end = t.optimize_dual(options, &mut trace)?;
+        return Ok(finish(&t, problem, end, trace));
+    }
+
+    let mut t = Tableau::standard_form(problem);
+    let end = match method {
         Method::Simplex if t.has_artificials() => return Err(Error::ArtificialVariablesRequired),
         Method::Simplex => t.single_phase(sense, costs, Coef::zero(), options, &mut trace)?,
         Method::TwoPhase if !t.has_artificials() => {
@@ -154,13 +176,112 @@ pub fn solve(problem: &Problem, method: Method, options: &Options) -> Result<Sol
             };
             t.single_phase(sense, costs, penalty, options, &mut trace)?
         }
+        Method::DualSimplex => unreachable!("handled above"),
     };
+    Ok(finish(&t, problem, end, trace))
+}
 
-    let sensitivity = match status {
+/// Re-optimizes a solved problem after appending constraints to it, with the dual simplex.
+///
+/// `problem` must be `previous.problem` plus zero or more `<=` / `>=` constraints at the end,
+/// and `previous` must be optimal. The trace starts from the previous final tableau (without
+/// artificial columns) with the new rows added, each expressed in the current basis with its
+/// own slack basic ([`Step::ConstraintAdded`]), and continues with dual simplex pivots until
+/// the tableau is feasible again or a row proves the extended problem infeasible.
+///
+/// ```
+/// use simplex_trace::{reoptimize, solve, Method, Options, Problem, Relation, Status, ratio};
+///
+/// // TOYCO (Taha): max 3x1 + 2x2 + 5x3, optimal at z = 1350.
+/// let toyco = Problem::maximize([3, 2, 5])
+///     .subject_to([1, 2, 1], Relation::Le, 430)
+///     .subject_to([3, 0, 2], Relation::Le, 460)
+///     .subject_to([1, 4, 0], Relation::Le, 420);
+/// let first = solve(&toyco, Method::Simplex, &Options::default()).unwrap();
+///
+/// // A new constraint the current optimum violates: one dual pivot fixes it.
+/// let extended = toyco.subject_to([3, 3, 1], Relation::Le, 500);
+/// let second = reoptimize(&first, &extended, &Options::default()).unwrap();
+/// assert_eq!(
+///     second.status,
+///     Status::Optimal { objective: ratio(1330, 1), values: vec![ratio(0, 1), ratio(90, 1), ratio(230, 1)] }
+/// );
+/// assert_eq!(second.trace.pivot_count(), 1);
+/// ```
+pub fn reoptimize(
+    previous: &Solution,
+    problem: &Problem,
+    options: &Options,
+) -> Result<Solution, Error> {
+    problem.validate()?;
+    let old = &previous.problem;
+    let (Status::Optimal { .. }, Some(sensitivity)) = (&previous.status, &previous.sensitivity)
+    else {
+        return Err(Error::NotOptimal);
+    };
+    let m = old.constraints.len();
+    let same_prefix = problem.sense == old.sense
+        && problem.objective == old.objective
+        && problem.var_names == old.var_names
+        && problem.constraints.len() >= m
+        && problem.constraints[..m] == old.constraints[..];
+    if !same_prefix {
+        return Err(Error::InvalidProblem(
+            "the extended problem must be the previous problem with constraints appended".into(),
+        ));
+    }
+    for (i, c) in problem.constraints.iter().enumerate().skip(m) {
+        if c.relation == Relation::Eq {
+            return Err(Error::NotDualFeasible(format!(
+                "constraint {} is an equality; added constraints must be <= or >=",
+                i + 1
+            )));
+        }
+    }
+
+    let mut trace = Trace::new(problem.sense);
+    let mut t = Tableau::from_basis(old, sensitivity)?;
+    t.append_constraints(problem, m, &mut trace);
+    let end = t.optimize_dual(options, &mut trace)?;
+    Ok(finish(&t, problem, end, trace))
+}
+
+/// The dual simplex needs the slack basis to be dual feasible: the starting objective row is
+/// `-c_j`, which has the optimal sign exactly when every cost has the right sign.
+fn check_dual_feasible(problem: &Problem) -> Result<(), Error> {
+    for (i, c) in problem.constraints.iter().enumerate() {
+        if c.relation == Relation::Eq {
+            return Err(Error::NotDualFeasible(format!(
+                "constraint {} is an equality, which has no slack",
+                i + 1
+            )));
+        }
+    }
+    let (wrong, needs) = match problem.sense {
+        Sense::Maximize => (Signed::is_positive as fn(&Rational) -> bool, "non-positive"),
+        Sense::Minimize => (Signed::is_negative as fn(&Rational) -> bool, "non-negative"),
+    };
+    if let Some((j, c)) = problem.objective.iter().enumerate().find(|(_, c)| wrong(c)) {
+        return Err(Error::NotDualFeasible(format!(
+            "{} has cost {c}, but the costs must be {needs} when {}",
+            problem.var_name(j),
+            match problem.sense {
+                Sense::Maximize => "maximizing",
+                Sense::Minimize => "minimizing",
+            }
+        )));
+    }
+    Ok(())
+}
+
+/// Builds the solution from the final tableau: status, sensitivity (if optimal) and the
+/// closing step of the trace.
+fn finish(t: &Tableau, problem: &Problem, end: End, mut trace: Trace) -> Solution {
+    let sensitivity = match end {
         End::Optimal => t.sensitivity(problem),
         _ => None,
     };
-    let (status, termination) = match status {
+    let (status, termination) = match end {
         End::Optimal => {
             let status = Status::Optimal {
                 objective: t.z_rhs.c.clone(),
@@ -172,11 +293,12 @@ pub fn solve(problem: &Problem, method: Method, options: &Options) -> Result<Sol
         End::Unbounded => (Status::Unbounded, Termination::Unbounded),
     };
     trace.push(Step::Finished { termination });
-    Ok(Solution {
+    Solution {
         status,
+        problem: problem.clone(),
         sensitivity,
         trace,
-    })
+    }
 }
 
 enum End {
@@ -287,6 +409,155 @@ impl Tableau {
             basis,
             z: vec![Coef::zero(); width],
             z_rhs: Coef::zero(),
+        }
+    }
+
+    /// The dual simplex start: every constraint written as `<=` (a `>=` is multiplied by `-1`,
+    /// whatever the sign of its right-hand side) with a slack, so the slacks form the basis.
+    /// Right-hand sides may be negative. Equalities must have been rejected before.
+    fn dual_form(problem: &Problem) -> Self {
+        let n = problem.num_vars();
+        let m = problem.constraints.len();
+        let width = n + m;
+        let mut names: Vec<String> = (0..n).map(|j| problem.var_name(j)).collect();
+        names.extend((0..m).map(|i| format!("s{}", i + 1)));
+
+        let mut rows = Vec::with_capacity(m);
+        let mut rhs = Vec::with_capacity(m);
+        for (i, c) in problem.constraints.iter().enumerate() {
+            let mut row = vec![Rational::zero(); width];
+            let (coeffs, b) = match c.relation {
+                Relation::Le => (c.coeffs.clone(), c.rhs.clone()),
+                Relation::Ge => (
+                    c.coeffs.iter().map(|v| -v.clone()).collect(),
+                    -c.rhs.clone(),
+                ),
+                Relation::Eq => unreachable!("rejected by check_dual_feasible"),
+            };
+            row[..n].clone_from_slice(&coeffs);
+            row[n + i] = Rational::one();
+            rows.push(row);
+            rhs.push(b);
+        }
+
+        Tableau {
+            sense: problem.sense,
+            objective_label: "z",
+            artificial: vec![false; width],
+            artificial_owner: vec![None; width],
+            removed: Vec::new(),
+            names,
+            rows,
+            rhs,
+            basis: (n..width).collect(),
+            z: vec![Coef::zero(); width],
+            z_rhs: Coef::zero(),
+        }
+    }
+
+    /// Rebuilds the final tableau of an optimal solution of `problem` from its basis: the
+    /// real columns of the standard form (artificial columns dropped), without the rows of
+    /// redundant equalities, pivoted to `sensitivity.basic_variables` in that row order.
+    fn from_basis(problem: &Problem, sensitivity: &Sensitivity) -> Result<Self, Error> {
+        let mismatch =
+            || Error::InvalidProblem("the previous solution does not belong to its problem".into());
+        let mut t = Tableau::standard_form(problem);
+        let real = t
+            .artificial
+            .iter()
+            .position(|&a| a)
+            .unwrap_or(t.names.len());
+        t.names.truncate(real);
+        t.artificial.truncate(real);
+        t.artificial_owner.truncate(real);
+        for row in t.rows.iter_mut() {
+            row.truncate(real);
+        }
+        t.z = vec![Coef::zero(); real];
+
+        if sensitivity.constraints.len() != t.rows.len() {
+            return Err(mismatch());
+        }
+        t.removed = (0..t.rows.len())
+            .filter(|&i| sensitivity.constraints[i].redundant)
+            .collect();
+        for &i in t.removed.iter().rev() {
+            t.rows.remove(i);
+            t.rhs.remove(i);
+        }
+
+        let basis: Vec<usize> = sensitivity
+            .basic_variables
+            .iter()
+            .map(|name| t.names.iter().position(|n| n == name).ok_or_else(mismatch))
+            .collect::<Result<_, _>>()?;
+        if basis.len() != t.rows.len() {
+            return Err(mismatch());
+        }
+        // Gauss-Jordan: make each basic column a unit vector, one unassigned row at a time
+        // (the basis matrix is nonsingular, so a usable row always exists), then put the
+        // rows in basis order so the tableau reads like the one in the trace.
+        let mut assigned = vec![false; t.rows.len()];
+        let mut row_of = Vec::with_capacity(basis.len());
+        for &j in &basis {
+            let i = (0..t.rows.len())
+                .find(|&i| !assigned[i] && !t.rows[i][j].is_zero())
+                .ok_or_else(mismatch)?;
+            t.pivot(i, j);
+            assigned[i] = true;
+            row_of.push(i);
+        }
+        t.rows = row_of.iter().map(|&i| t.rows[i].clone()).collect();
+        t.rhs = row_of.iter().map(|&i| t.rhs[i].clone()).collect();
+        t.basis = basis;
+        t.set_objective(problem.sense, "z", &problem.objective, &Coef::zero());
+        Ok(t)
+    }
+
+    /// Appends constraints `from..` of `problem` as new rows, each written as `<=` with a new
+    /// slack that is basic, and priced out against the current basis so the tableau stays
+    /// consistent. A negative right-hand side means the current solution violates it.
+    fn append_constraints(&mut self, problem: &Problem, from: usize, trace: &mut Trace) {
+        let n = problem.num_vars();
+        for (i, c) in problem.constraints.iter().enumerate().skip(from) {
+            let (coeffs, mut b): (Vec<Rational>, Rational) = match c.relation {
+                Relation::Le => (c.coeffs.clone(), c.rhs.clone()),
+                Relation::Ge => (
+                    c.coeffs.iter().map(|v| -v.clone()).collect(),
+                    -c.rhs.clone(),
+                ),
+                Relation::Eq => unreachable!("rejected by reoptimize"),
+            };
+            self.names.push(format!("s{}", i + 1));
+            self.artificial.push(false);
+            self.artificial_owner.push(None);
+            self.z.push(Coef::zero());
+            for row in self.rows.iter_mut() {
+                row.push(Rational::zero());
+            }
+            let width = self.names.len();
+            let mut row = vec![Rational::zero(); width];
+            row[..n].clone_from_slice(&coeffs);
+            row[width - 1] = Rational::one();
+            for (r, &j) in self.basis.iter().enumerate() {
+                let factor = row[j].clone();
+                if factor.is_zero() {
+                    continue;
+                }
+                for (v, p) in row.iter_mut().zip(&self.rows[r]) {
+                    *v -= &factor * p;
+                }
+                b -= &factor * &self.rhs[r];
+            }
+            let satisfied = !b.is_negative();
+            self.rows.push(row);
+            self.rhs.push(b);
+            self.basis.push(width - 1);
+            trace.push(Step::ConstraintAdded {
+                constraint: i,
+                row: self.rows.len() - 1,
+                satisfied,
+            });
         }
     }
 
@@ -467,6 +738,87 @@ impl Tableau {
             self.pivot(leaving_row, entering);
             iteration += 1;
         }
+    }
+
+    /// Dual simplex iterations from a dual feasible tableau (objective row with the optimal
+    /// sign) until every right-hand side is non-negative, or a row proves infeasibility.
+    fn optimize_dual(&mut self, options: &Options, trace: &mut Trace) -> Result<End, Error> {
+        let phase = Phase::Dual;
+        let mut iteration = 0;
+        loop {
+            trace.push(Step::Tableau {
+                phase,
+                iteration,
+                snapshot: self.snapshot(),
+            });
+
+            let Some(leaving_row) = self.leaving_row(options.pivot_rule) else {
+                return Ok(End::Optimal);
+            };
+            let leaving = self.basis[leaving_row];
+            let (ratios, entering) = self.dual_ratio_test(leaving_row);
+            let Some(entering) = entering else {
+                trace.push(Step::InfeasibleRow {
+                    row: leaving_row,
+                    basic: NamedValue::new(
+                        self.names[leaving].clone(),
+                        self.rhs[leaving_row].clone(),
+                    ),
+                });
+                return Ok(End::Infeasible);
+            };
+            if iteration == options.max_iterations {
+                return Err(Error::IterationLimit(options.max_iterations));
+            }
+
+            trace.push(Step::DualPivot {
+                phase,
+                iteration,
+                leaving_row,
+                leaving,
+                leaving_name: self.names[leaving].clone(),
+                entering,
+                entering_name: self.names[entering].clone(),
+                pivot_value: self.rows[leaving_row][entering].clone(),
+                ratios,
+            });
+            self.pivot(leaving_row, entering);
+            iteration += 1;
+        }
+    }
+
+    /// Dual simplex leaving row, among those with a negative right-hand side: Dantzig takes
+    /// the most negative (ties: lowest basic variable index), Bland the lowest basic variable
+    /// index. `None` when the tableau is already feasible.
+    fn leaving_row(&self, rule: PivotRule) -> Option<usize> {
+        let negative = (0..self.rows.len()).filter(|&i| self.rhs[i].is_negative());
+        match rule {
+            PivotRule::Dantzig => negative.min_by_key(|&i| (self.rhs[i].clone(), self.basis[i])),
+            PivotRule::Bland => negative.min_by_key(|&i| self.basis[i]),
+        }
+    }
+
+    /// Dual ratio test on `row`: among the columns with a negative entry, the one with the
+    /// smallest `|z_j - c_j| / |a_rj|` enters, which keeps the objective row dual feasible
+    /// after the pivot. Ties go to the lowest column index. No eligible column means the row
+    /// cannot be satisfied.
+    fn dual_ratio_test(&self, row: usize) -> (Vec<DualRatioTest>, Option<usize>) {
+        let ratios: Vec<DualRatioTest> = (0..self.names.len())
+            .map(|j| {
+                let a = &self.rows[row][j];
+                let ratio = a.is_negative().then(|| {
+                    debug_assert!(self.z[j].m.is_zero(), "dual simplex with a symbolic M");
+                    self.z[j].c.abs() / a.abs()
+                });
+                DualRatioTest { column: j, ratio }
+            })
+            .collect();
+        let entering = ratios
+            .iter()
+            .filter_map(|r| r.ratio.as_ref().map(|v| (v, r.column)))
+            .min()
+            .map(|(_, j)| j);
+        (ratios, entering)
     }
 
     /// Basic artificial variables with a positive value.

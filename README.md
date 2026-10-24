@@ -14,7 +14,8 @@ course: no `0.9999999`, no hidden iterations.
 - **Full trace:** every tableau snapshot, the entering/leaving variables, the minimum-ratio test,
   phase 1 results, artificial variables driven out of the basis and redundant rows removed.
 - **Pivot rules:** Dantzig (textbook) or Bland (anti-cycling).
-- **Detects** infeasible and unbounded problems.
+- **Always conclusive:** every method reports optimal, infeasible or unbounded, and the trace
+  says why.
 - Pure Rust, no I/O, no unsafe.
 
 ## Example
@@ -80,7 +81,11 @@ match the textbook line by line:
 - **Maximize:** the most negative `z_j - c_j` enters; optimal when all are `>= 0`.
   **Minimize:** the most positive enters; optimal when all are `<= 0`.
   `Snapshot::is_optimal` applies the right rule.
-- **Big-M:** artificial variables cost `-M` when maximizing and `+M` when minimizing.
+- **Big-M:** artificial variables cost `-M` when maximizing and `+M` when minimizing. The `M`
+  part of the objective row is improved first (both pivot rules), so when the run stops — at an
+  optimal tableau or at an unbounded direction — the penalty cannot improve any further. If an
+  artificial variable is still positive at that point the problem is infeasible, and the trace
+  records it as `Step::ArtificialRemainsPositive`.
 - **Two-phase:** phase 1 minimizes `r = a1 + a2 + ...` and its row is labelled `r`; phase 2
   drops the artificial columns and prices out the real objective.
 - Constraints with a negative right-hand side are multiplied by `-1` (flipping `<=`/`>=`).

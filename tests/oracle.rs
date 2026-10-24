@@ -9,14 +9,19 @@
 //!
 //! The sensitivity analysis is checked the same way: every claimed range is probed by solving
 //! perturbed problems with brute force, at its ends and just beyond them.
+//!
+//! The dual simplex runs on every problem it applies to, plus extra problems built to be dual
+//! feasible, and every optimal solution is re-optimized after appending random constraints;
+//! both are compared with brute force and checked step by step.
 
 use num_traits::{Signed, Zero};
 use simplex_trace::{
     Error, Interval, Method, Options, Phase, PivotRule, Problem, Rational, Relation, Sense,
-    Sensitivity, Snapshot, Solution, Status, Step, Termination, ratio, solve,
+    Sensitivity, Snapshot, Solution, Status, Step, Termination, ratio, reoptimize, solve,
 };
 
 const CASES: usize = 600;
+const DUAL_CASES: usize = 150;
 const BIG_K: i64 = 1_000_000_000;
 
 /// Small deterministic xorshift generator, so failures are reproducible without extra deps.
@@ -87,6 +92,59 @@ fn random_slack_only(rng: &mut Rng) -> Problem {
         problem = problem.subject_to(coeffs, Relation::Le, rhs);
     }
     problem
+}
+
+/// `<=` and `>=` constraints with right-hand sides of any sign, and costs with the sign the
+/// dual simplex needs (non-negative when minimizing, non-positive when maximizing), so the
+/// slack basis is dual feasible: never unbounded, often infeasible to start from.
+fn random_dual_feasible(rng: &mut Rng) -> Problem {
+    let n = rng.range(2, 4) as usize;
+    let costs: Vec<i64> = (0..n).map(|_| rng.range(0, 5)).collect();
+    let mut problem = if rng.chance(50) {
+        Problem::maximize(costs.iter().map(|c| -c))
+    } else {
+        Problem::minimize(costs)
+    };
+    for _ in 0..rng.range(1, 4) {
+        let coeffs: Vec<i64> = (0..n).map(|_| rng.range(-3, 4)).collect();
+        let relation = if rng.chance(50) {
+            Relation::Le
+        } else {
+            Relation::Ge
+        };
+        let rhs = if rng.chance(20) { 0 } else { rng.range(-6, 12) };
+        problem = problem.subject_to(coeffs, relation, rhs);
+    }
+    problem
+}
+
+/// `problem` plus one or two `<=` / `>=` constraints: sometimes already satisfied by the
+/// optimum, sometimes violated, sometimes incompatible with the feasible region.
+fn random_extension(rng: &mut Rng, problem: &Problem) -> Problem {
+    let n = problem.num_vars();
+    let mut extended = problem.clone();
+    for _ in 0..rng.range(1, 2) {
+        let coeffs: Vec<i64> = (0..n).map(|_| rng.range(-3, 4)).collect();
+        let relation = if rng.chance(50) {
+            Relation::Le
+        } else {
+            Relation::Ge
+        };
+        extended = extended.subject_to(coeffs, relation, rng.range(-4, 12));
+    }
+    extended
+}
+
+/// Whether the dual simplex can start from the slack basis of `problem`.
+fn is_dual_feasible(problem: &Problem) -> bool {
+    problem
+        .constraints
+        .iter()
+        .all(|c| c.relation != Relation::Eq)
+        && problem.objective.iter().all(|c| match problem.sense {
+            Sense::Maximize => !c.is_positive(),
+            Sense::Minimize => !c.is_negative(),
+        })
 }
 
 /// Whether the standard form of `problem` has an artificial variable.
@@ -238,6 +296,155 @@ struct Stats {
     pinned_constraints: usize,
     range_probes: usize,
     strict_probes_beyond: usize,
+    dual_runs: usize,
+    dual_start_feasible: usize,
+    dual_pivots: usize,
+    dual_degenerate_pivots: usize,
+    dual_infeasible_rows: usize,
+    reoptimized: usize,
+    reoptimize_satisfied: usize,
+    reoptimize_violated: usize,
+    reoptimize_infeasible: usize,
+    reoptimize_from_rebased: usize,
+    reoptimize_with_redundant: usize,
+}
+
+/// Re-optimizes `previous` (optimal for `problem`) with the constraints `extended` appends,
+/// and checks the result: the starting tableau is the previous final tableau plus the new
+/// rows, the `ConstraintAdded` flags are right, nothing moves when nothing is violated, and
+/// the outcome matches brute force on the extended problem.
+#[allow(clippy::too_many_arguments)]
+fn check_reoptimize(
+    problem: &Problem,
+    extended: &Problem,
+    expected: &Expected,
+    rule: PivotRule,
+    previous: &Solution,
+    seen: &mut Vec<Sensitivity>,
+    stats: &mut Stats,
+    ctx: &str,
+) {
+    let m = problem.constraints.len();
+    let ctx = format!("{ctx}\nreoptimize with {:?}", &extended.constraints[m..]);
+    let options = Options::default().pivot_rule(rule);
+    let again = reoptimize(previous, extended, &options).unwrap_or_else(|e| panic!("{ctx}: {e}"));
+    assert_eq!(again.problem, *extended, "{ctx}");
+    stats.reoptimized += 1;
+    let s = previous.sensitivity.as_ref().unwrap();
+    stats.reoptimize_from_rebased += (!s.from_final_tableau) as usize;
+    stats.reoptimize_with_redundant += s.constraints.iter().any(|c| c.redundant) as usize;
+    let Status::Optimal {
+        objective: old_objective,
+        values: old_values,
+    } = &previous.status
+    else {
+        unreachable!()
+    };
+
+    // One `ConstraintAdded` per new constraint, in order, with the right flag.
+    let added: Vec<(usize, usize, bool)> = again
+        .trace
+        .steps
+        .iter()
+        .filter_map(|step| match step {
+            Step::ConstraintAdded {
+                constraint,
+                row,
+                satisfied,
+                ..
+            } => Some((*constraint, *row, *satisfied)),
+            _ => None,
+        })
+        .collect();
+    let kept_rows = s.constraints.iter().filter(|c| !c.redundant).count();
+    assert_eq!(added.len(), extended.constraints.len() - m, "{ctx}");
+    let mut all_satisfied = true;
+    for (k, &(constraint, row, satisfied)) in added.iter().enumerate() {
+        assert_eq!(constraint, m + k, "{ctx}");
+        assert_eq!(row, kept_rows + k, "{ctx}");
+        let c = &extended.constraints[constraint];
+        let activity: Rational = c.coeffs.iter().zip(old_values).map(|(a, x)| a * x).sum();
+        let holds = match c.relation {
+            Relation::Le => activity <= c.rhs,
+            Relation::Ge => activity >= c.rhs,
+            Relation::Eq => activity == c.rhs,
+        };
+        assert_eq!(
+            satisfied,
+            holds,
+            "{ctx}: flag of constraint {}",
+            constraint + 1
+        );
+        all_satisfied &= holds;
+    }
+
+    // The start is the previous final tableau: real columns only, redundant rows gone, same
+    // basis in the same order, same objective value, plus the new rows.
+    let first = again.trace.tableaus().next().unwrap();
+    assert_eq!(first.rows.len(), kept_rows + added.len(), "{ctx}");
+    assert!(
+        first.columns.iter().all(|c| !c.starts_with('a')),
+        "{ctx}: artificial column kept"
+    );
+    assert_eq!(&first.z_rhs.c, old_objective, "{ctx}: start objective");
+    let old_basis: Vec<&String> = first.basis[..kept_rows]
+        .iter()
+        .map(|&b| &first.columns[b])
+        .collect();
+    let want: Vec<&String> = s.basic_variables.iter().collect();
+    assert_eq!(old_basis, want, "{ctx}: previous basis");
+    for (r, &b) in first.basis[..kept_rows].iter().enumerate() {
+        if b < problem.num_vars() {
+            assert_eq!(first.rhs[r], old_values[b], "{ctx}: previous value kept");
+        }
+    }
+    if all_satisfied {
+        stats.reoptimize_satisfied += 1;
+        assert_eq!(
+            again.trace.pivot_count(),
+            0,
+            "{ctx}: pivots with nothing violated"
+        );
+        assert_eq!(again.status, previous.status, "{ctx}");
+    } else {
+        stats.reoptimize_violated += 1;
+    }
+
+    check_trace(extended, rule, &again, stats, &ctx);
+    match (&again.status, expected) {
+        (Status::Optimal { objective, values }, Expected::Optimal(best)) => {
+            assert_eq!(objective, best, "{ctx}");
+            assert!(
+                feasible(extended, values),
+                "{ctx}: infeasible point {values:?}"
+            );
+            let last = again.trace.tableaus().last().unwrap();
+            assert!(last.is_optimal() && last.is_feasible(), "{ctx}");
+            assert_eq!(&last.z_rhs.c, best, "{ctx}");
+            check_sensitivity(
+                extended,
+                Method::DualSimplex,
+                &again,
+                objective,
+                values,
+                seen,
+                stats,
+                &ctx,
+            );
+        }
+        (Status::Infeasible, Expected::Infeasible) => {
+            stats.reoptimize_infeasible += 1;
+            assert!(
+                again
+                    .trace
+                    .steps
+                    .iter()
+                    .any(|step| matches!(step, Step::InfeasibleRow { .. })),
+                "{ctx}: infeasible without the row that proves it"
+            );
+        }
+        (got, want) => panic!("{ctx}: got {got:?}, want {want:?}"),
+    }
 }
 
 /// Checks the sensitivity report of an optimal solution: its duality relations against the
@@ -499,6 +706,8 @@ fn check_trace(
     ctx: &str,
 ) {
     let mut current: Option<&Snapshot> = None;
+    // `ConstraintAdded` steps come before the tableau they describe.
+    let mut pending_added: Vec<(usize, usize, bool)> = Vec::new();
     for step in &solution.trace.steps {
         match step {
             Step::Tableau {
@@ -510,10 +719,31 @@ fn check_trace(
                 };
                 assert_eq!(snapshot.sense, sense, "{ctx}");
                 assert_eq!(snapshot.objective_label, label, "{ctx}");
-                assert!(
-                    snapshot.rhs.iter().all(|b| !b.is_negative()),
-                    "{ctx}: negative rhs (lost primal feasibility)"
-                );
+                if *phase == Phase::Dual {
+                    // The dual simplex keeps the objective row optimal and works on feasibility.
+                    assert!(
+                        snapshot.is_optimal(),
+                        "{ctx}: dual tableau lost dual feasibility"
+                    );
+                } else {
+                    assert!(
+                        snapshot.rhs.iter().all(|b| !b.is_negative()),
+                        "{ctx}: negative rhs (lost primal feasibility)"
+                    );
+                }
+                for &(constraint, row, satisfied) in &pending_added {
+                    assert_eq!(
+                        snapshot.rhs[row].is_negative(),
+                        !satisfied,
+                        "{ctx}: satisfied flag vs rhs of the added row"
+                    );
+                    assert_eq!(
+                        snapshot.columns[snapshot.basis[row]],
+                        format!("s{}", constraint + 1),
+                        "{ctx}: the added row's slack is basic"
+                    );
+                }
+                pending_added.clear();
                 for (i, &b) in snapshot.basis.iter().enumerate() {
                     assert!(
                         snapshot.z[b].is_zero(),
@@ -621,6 +851,68 @@ fn check_trace(
                     stats.big_m_infeasible_at_optimum += 1;
                 }
             }
+            Step::DualPivot {
+                leaving_row,
+                leaving,
+                entering,
+                pivot_value,
+                ratios,
+                ..
+            } => {
+                let t = current.expect("dual pivot before any tableau");
+                assert!(
+                    t.rhs[*leaving_row].is_negative(),
+                    "{ctx}: leaving row is feasible"
+                );
+                let negative = (0..t.rows.len()).filter(|&i| t.rhs[i].is_negative());
+                let want = match rule {
+                    PivotRule::Dantzig => negative.min_by_key(|&i| (t.rhs[i].clone(), t.basis[i])),
+                    PivotRule::Bland => negative.min_by_key(|&i| t.basis[i]),
+                    other => panic!("{ctx}: pivot rule not covered by the oracle: {other:?}"),
+                };
+                assert_eq!(Some(*leaving_row), want, "{ctx}: leaving row by {rule:?}");
+                assert_eq!(*leaving, t.basis[*leaving_row], "{ctx}");
+
+                assert_eq!(ratios.len(), t.columns.len(), "{ctx}");
+                for (j, r) in ratios.iter().enumerate() {
+                    assert_eq!(r.column, j, "{ctx}");
+                    assert!(t.z[j].m.is_zero(), "{ctx}: M in a dual tableau");
+                    let a = &t.rows[*leaving_row][j];
+                    let want = a.is_negative().then(|| t.z[j].c.abs() / a.abs());
+                    assert_eq!(r.ratio, want, "{ctx}: dual ratio test column {j}");
+                }
+                let (min, column) = ratios
+                    .iter()
+                    .filter_map(|r| r.ratio.as_ref().map(|v| (v, r.column)))
+                    .min()
+                    .unwrap();
+                assert_eq!(*entering, column, "{ctx}: not the minimum dual ratio");
+                assert_eq!(pivot_value, &t.rows[*leaving_row][*entering], "{ctx}");
+                assert!(pivot_value.is_negative(), "{ctx}");
+
+                stats.dual_pivots += 1;
+                if min.is_zero() {
+                    stats.dual_degenerate_pivots += 1;
+                }
+            }
+            Step::InfeasibleRow { row, basic, .. } => {
+                let t = current.expect("infeasible row before any tableau");
+                assert_eq!(solution.status, Status::Infeasible, "{ctx}");
+                assert!(t.rhs[*row].is_negative(), "{ctx}");
+                assert!(
+                    t.rows[*row].iter().all(|a| !a.is_negative()),
+                    "{ctx}: the row has a negative entry"
+                );
+                assert_eq!(basic.name, t.columns[t.basis[*row]], "{ctx}");
+                assert_eq!(basic.value, t.rhs[*row], "{ctx}");
+                stats.dual_infeasible_rows += 1;
+            }
+            Step::ConstraintAdded {
+                constraint,
+                row,
+                satisfied,
+                ..
+            } => pending_added.push((*constraint, *row, *satisfied)),
             Step::PhaseOneFinished { .. } | Step::Finished { .. } => {}
             other => panic!("{ctx}: step not covered by the oracle: {other:?}"),
         }
@@ -641,14 +933,23 @@ fn check_trace(
 #[test]
 fn matches_brute_force_on_random_problems() {
     let mut rng = Rng(0x5EED_1234_ABCD_0001);
+    // Separate generators, so these do not reshuffle the base cases.
+    let mut dual_rng = Rng(0xD0A1_5EED_0000_0002);
+    let mut ext_rng = Rng(0xE7E0_5EED_0000_0003);
     let mut stats = Stats::default();
 
-    for case in 0..CASES {
-        let problem = if case % 3 == 0 {
-            random_slack_only(&mut rng)
-        } else {
-            random_general(&mut rng)
-        };
+    let mut cases: Vec<Problem> = (0..CASES)
+        .map(|case| {
+            if case % 3 == 0 {
+                random_slack_only(&mut rng)
+            } else {
+                random_general(&mut rng)
+            }
+        })
+        .collect();
+    cases.extend((0..DUAL_CASES).map(|_| random_dual_feasible(&mut dual_rng)));
+
+    for (case, problem) in cases.into_iter().enumerate() {
         let expected = reference(&problem);
         let mut seen = Vec::new();
         match expected {
@@ -656,8 +957,23 @@ fn matches_brute_force_on_random_problems() {
             Expected::Infeasible => stats.infeasible += 1,
             Expected::Unbounded => stats.unbounded += 1,
         }
+        // One random extension per case, to re-optimize every optimal solution with.
+        let extension = match &expected {
+            Expected::Optimal(_) => {
+                let extended = random_extension(&mut ext_rng, &problem);
+                let expected = reference(&extended);
+                Some((extended, expected))
+            }
+            _ => None,
+        };
+        let mut seen_extended = Vec::new();
 
-        for method in [Method::Simplex, Method::BigM, Method::TwoPhase] {
+        for method in [
+            Method::Simplex,
+            Method::BigM,
+            Method::TwoPhase,
+            Method::DualSimplex,
+        ] {
             for rule in [PivotRule::Dantzig, PivotRule::Bland] {
                 let ctx = format!("case {case} {method:?} {rule:?}\n{problem:?}");
                 let options = Options::default().pivot_rule(rule);
@@ -667,11 +983,27 @@ fn matches_brute_force_on_random_problems() {
                         assert!(needs_artificials(&problem), "{ctx}");
                         continue;
                     }
+                    Err(Error::NotDualFeasible(_)) if method == Method::DualSimplex => {
+                        assert!(!is_dual_feasible(&problem), "{ctx}");
+                        continue;
+                    }
                     Err(e) => panic!("{ctx}: {e}"),
                 };
+                assert_eq!(solution.problem, problem, "{ctx}");
                 if method == Method::Simplex {
                     assert!(!needs_artificials(&problem), "{ctx}");
                     stats.simplex_runs += 1;
+                }
+                if method == Method::DualSimplex {
+                    assert!(is_dual_feasible(&problem), "{ctx}");
+                    stats.dual_runs += 1;
+                    let first = solution.trace.tableaus().next().unwrap();
+                    stats.dual_start_feasible += first.is_feasible() as usize;
+                    assert_ne!(
+                        solution.status,
+                        Status::Unbounded,
+                        "{ctx}: dual ended unbounded"
+                    );
                 }
                 if method == Method::BigM && solution.status == Status::Infeasible {
                     assert!(
@@ -704,12 +1036,25 @@ fn matches_brute_force_on_random_problems() {
                         let last = solution.trace.tableaus().last().unwrap();
                         assert_eq!(last.sense, problem.sense, "{ctx}");
                         assert!(last.is_optimal(), "{ctx}: final tableau not optimal");
+                        assert!(last.is_feasible(), "{ctx}: final tableau not feasible");
                         assert!(last.z_rhs.m.is_zero(), "{ctx}: M left in objective");
                         assert_eq!(&last.z_rhs.c, best, "{ctx}: tableau objective");
                         check_sensitivity(
                             &problem, method, &solution, objective, values, &mut seen, &mut stats,
                             &ctx,
                         );
+                        if let Some((extended, expected)) = &extension {
+                            check_reoptimize(
+                                &problem,
+                                extended,
+                                expected,
+                                rule,
+                                &solution,
+                                &mut seen_extended,
+                                &mut stats,
+                                &ctx,
+                            );
+                        }
                     }
                     (Status::Infeasible, Expected::Infeasible)
                     | (Status::Unbounded, Expected::Unbounded) => {
@@ -739,4 +1084,15 @@ fn matches_brute_force_on_random_problems() {
     assert!(stats.pinned_constraints >= 5, "{stats:#?}");
     assert!(stats.strict_probes_beyond >= 1000, "{stats:#?}");
     assert!(stats.sensitivity_rebased >= 10, "{stats:#?}");
+    assert!(stats.dual_runs >= 300, "{stats:#?}");
+    assert!(stats.dual_start_feasible >= 20, "{stats:#?}");
+    assert!(stats.dual_pivots >= 300, "{stats:#?}");
+    assert!(stats.dual_degenerate_pivots >= 20, "{stats:#?}");
+    assert!(stats.dual_infeasible_rows >= 30, "{stats:#?}");
+    assert!(stats.reoptimized >= 1000, "{stats:#?}");
+    assert!(stats.reoptimize_satisfied >= 200, "{stats:#?}");
+    assert!(stats.reoptimize_violated >= 300, "{stats:#?}");
+    assert!(stats.reoptimize_infeasible >= 50, "{stats:#?}");
+    assert!(stats.reoptimize_from_rebased >= 5, "{stats:#?}");
+    assert!(stats.reoptimize_with_redundant >= 5, "{stats:#?}");
 }

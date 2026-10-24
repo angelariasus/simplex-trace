@@ -6,7 +6,7 @@
 
 use serde_json::{Value, json};
 use simplex_trace::{
-    Method, Options, PivotRule, Problem, Relation, Solution, Status, ratio, solve,
+    Method, Options, PivotRule, Problem, Relation, Solution, Status, ratio, reoptimize, solve,
 };
 
 /// Taha: min z = 4x1 + x2  s.t.  3x1 + x2 = 3,  4x1 + 3x2 >= 6,  x1 + 2x2 <= 4.
@@ -230,8 +230,14 @@ fn options_and_method_format() {
     let options: Options = serde_json::from_str(r#"{ "pivot_rule": "bland" }"#).unwrap();
     assert_eq!(options, Options::default().pivot_rule(PivotRule::Bland));
     assert_eq!(
-        serde_json::to_value([Method::Simplex, Method::BigM, Method::TwoPhase]).unwrap(),
-        json!(["simplex", "big_m", "two_phase"])
+        serde_json::to_value([
+            Method::Simplex,
+            Method::BigM,
+            Method::TwoPhase,
+            Method::DualSimplex
+        ])
+        .unwrap(),
+        json!(["simplex", "big_m", "two_phase", "dual_simplex"])
     );
 }
 
@@ -298,5 +304,102 @@ fn sensitivity_format() {
     assert_eq!(
         value["sensitivity"]["constraints"][0]["source"],
         json!(null)
+    );
+}
+
+/// TOYCO (Taha): max 3x1 + 2x2 + 5x3, optimal at z = 1350.
+fn toyco() -> Problem {
+    Problem::maximize([3, 2, 5])
+        .subject_to([1, 2, 1], Relation::Le, 430)
+        .subject_to([3, 0, 2], Relation::Le, 460)
+        .subject_to([1, 4, 0], Relation::Le, 420)
+}
+
+#[test]
+fn dual_step_format() {
+    // Taha's dual simplex example: min 3x1 + 2x2.
+    let problem = Problem::minimize([3, 2])
+        .subject_to([3, 1], Relation::Ge, 3)
+        .subject_to([4, 3], Relation::Ge, 6)
+        .subject_to([1, 1], Relation::Le, 3);
+    let solution = solve(&problem, Method::DualSimplex, &Options::default()).unwrap();
+    let value = to_value(&solution);
+    let steps = value["trace"]["steps"].as_array().unwrap();
+    assert_eq!(steps[0]["type"], json!("tableau"));
+    assert_eq!(steps[0]["phase"], json!("dual"));
+    // s2 leaves (row 2, rhs -6); x2 enters with the smallest ratio 2/3 < 3/4.
+    assert_eq!(
+        steps[1],
+        json!({
+            "type": "dual_pivot",
+            "phase": "dual",
+            "iteration": 0,
+            "leaving_row": 1,
+            "leaving": 3,
+            "leaving_name": "s2",
+            "entering": 1,
+            "entering_name": "x2",
+            "pivot_value": "-3",
+            "ratios": [
+                { "column": 0, "ratio": "3/4" },
+                { "column": 1, "ratio": "2/3" },
+                { "column": 2, "ratio": null },
+                { "column": 3, "ratio": null },
+                { "column": 4, "ratio": null }
+            ]
+        })
+    );
+    assert_eq!(
+        steps.last().unwrap(),
+        &json!({ "type": "finished", "termination": "optimal" })
+    );
+}
+
+#[test]
+fn reoptimize_step_format() {
+    let first = solve(&toyco(), Method::Simplex, &Options::default()).unwrap();
+    let violated = toyco().subject_to([3, 3, 1], Relation::Le, 500);
+    let second = reoptimize(&first, &violated, &Options::default()).unwrap();
+    let value = to_value(&second);
+    assert_eq!(value["problem"], serde_json::to_value(&violated).unwrap());
+    let steps = value["trace"]["steps"].as_array().unwrap();
+    assert_eq!(
+        steps[0],
+        json!({ "type": "constraint_added", "constraint": 3, "row": 3, "satisfied": false })
+    );
+    assert_eq!(steps[1]["type"], json!("tableau"));
+    assert_eq!(steps[2]["type"], json!("dual_pivot"));
+
+    let impossible = toyco().subject_to([1, 1, 1], Relation::Ge, 2000);
+    let third = reoptimize(&first, &impossible, &Options::default()).unwrap();
+    let value = to_value(&third);
+    let steps = value["trace"]["steps"].as_array().unwrap();
+    assert_eq!(
+        steps[2],
+        json!({
+            "type": "infeasible_row",
+            "row": 3,
+            "basic": { "name": "s4", "value": "-1670" }
+        })
+    );
+    assert_eq!(value["status"], json!("infeasible"));
+}
+
+#[test]
+fn reoptimize_works_from_a_deserialized_solution() {
+    // A front end can send back the solution it received and ask for more constraints.
+    let first = solve(&toyco(), Method::BigM, &Options::default()).unwrap();
+    let json = serde_json::to_string(&first).unwrap();
+    let loaded: Solution = serde_json::from_str(&json).unwrap();
+    let extended = toyco().subject_to([3, 3, 1], Relation::Le, 500);
+    let from_loaded = reoptimize(&loaded, &extended, &Options::default()).unwrap();
+    let from_original = reoptimize(&first, &extended, &Options::default()).unwrap();
+    assert_eq!(from_loaded, from_original);
+    assert_eq!(
+        from_loaded.status,
+        Status::Optimal {
+            objective: ratio(1330, 1),
+            values: vec![ratio(0, 1), ratio(90, 1), ratio(230, 1)],
+        }
     );
 }

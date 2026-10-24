@@ -3,7 +3,7 @@
 //! Expected tables were checked by hand against the textbooks. If one of these tests fails,
 //! the presentation of the method changed — make sure that is intentional.
 
-use simplex_trace::{Method, Options, Phase, Problem, Relation, Sense, Step, solve};
+use simplex_trace::{Method, Options, Phase, Problem, Relation, Sense, Step, reoptimize, solve};
 
 fn tableaus(problem: &Problem, method: Method) -> Vec<String> {
     let solution = solve(problem, method, &Options::default()).unwrap();
@@ -198,4 +198,95 @@ fn maximization_phase_two_keeps_max_sense() {
         }
     }
     assert!(solution.trace.tableaus().last().unwrap().is_optimal());
+}
+
+/// Taha, dual simplex example: min z = 3x1 + 2x2  s.t.  3x1 + x2 >= 3,  4x1 + 3x2 >= 6,
+/// x1 + x2 <= 3. Both `>=` rows are multiplied by -1; the slack basis is dual feasible.
+#[test]
+fn taha_dual_simplex() {
+    let problem = Problem::minimize([3, 2])
+        .subject_to([3, 1], Relation::Ge, 3)
+        .subject_to([4, 3], Relation::Ge, 6)
+        .subject_to([1, 1], Relation::Le, 3);
+    assert_tableaus(
+        tableaus(&problem, Method::DualSimplex),
+        &[
+            r"
+basis | x1 | x2 | s1 | s2 | s3 | rhs
+------+----+----+----+----+----+----
+s1    | -3 | -1 |  1 |  0 |  0 |  -3
+s2    | -4 | -3 |  0 |  1 |  0 |  -6
+s3    |  1 |  1 |  0 |  0 |  1 |   3
+z     | -3 | -2 |  0 |  0 |  0 |   0",
+            r"
+basis |   x1 | x2 | s1 |   s2 | s3 | rhs
+------+------+----+----+------+----+----
+s1    | -5/3 |  0 |  1 | -1/3 |  0 |  -1
+x2    |  4/3 |  1 |  0 | -1/3 |  0 |   2
+s3    | -1/3 |  0 |  0 |  1/3 |  1 |   1
+z     | -1/3 |  0 |  0 | -2/3 |  0 |   4",
+            r"
+basis | x1 | x2 |   s1 |   s2 | s3 |  rhs
+------+----+----+------+------+----+-----
+x1    |  1 |  0 | -3/5 |  1/5 |  0 |  3/5
+x2    |  0 |  1 |  4/5 | -3/5 |  0 |  6/5
+s3    |  0 |  0 | -1/5 |  2/5 |  1 |  6/5
+z     |  0 |  0 | -1/5 | -3/5 |  0 | 21/5",
+        ],
+    );
+    // The whole trace as a student would write it.
+    let solution = solve(&problem, Method::DualSimplex, &Options::default()).unwrap();
+    let text = solution.trace.to_string();
+    assert!(text.contains("== dual simplex, iteration 0 =="), "{text}");
+    assert!(
+        text.contains("-> s2 leaves (row 2), x2 enters (pivot -3); ratios [x1: 3/4, x2: 2/3]"),
+        "{text}"
+    );
+    assert!(
+        text.contains("-> s1 leaves (row 1), x1 enters (pivot -5/3); ratios [x1: 1/5, s2: 2]"),
+        "{text}"
+    );
+}
+
+/// Taha, TOYCO: max z = 3x1 + 2x2 + 5x3 with the optimum at z = 1350, then the constraint
+/// 3x1 + 3x2 + x3 <= 500 is added. The optimum violates it (530 > 500): one dual pivot.
+#[test]
+fn taha_toyco_added_constraint() {
+    let toyco = Problem::maximize([3, 2, 5])
+        .subject_to([1, 2, 1], Relation::Le, 430)
+        .subject_to([3, 0, 2], Relation::Le, 460)
+        .subject_to([1, 4, 0], Relation::Le, 420);
+    let first = solve(&toyco, Method::Simplex, &Options::default()).unwrap();
+    let extended = toyco.subject_to([3, 3, 1], Relation::Le, 500);
+    let second = reoptimize(&first, &extended, &Options::default()).unwrap();
+    assert_tableaus(
+        second.trace.tableaus().map(ToString::to_string).collect(),
+        &[
+            r"
+basis |   x1 | x2 | x3 |   s1 |   s2 | s3 | s4 |  rhs
+------+------+----+----+------+------+----+----+-----
+x2    | -1/4 |  1 |  0 |  1/2 | -1/4 |  0 |  0 |  100
+x3    |  3/2 |  0 |  1 |    0 |  1/2 |  0 |  0 |  230
+s3    |    2 |  0 |  0 |   -2 |    1 |  1 |  0 |   20
+s4    |  9/4 |  0 |  0 | -3/2 |  1/4 |  0 |  1 |  -30
+z     |    4 |  0 |  0 |    1 |    2 |  0 |  0 | 1350",
+            r"
+basis |   x1 | x2 | x3 | s1 |   s2 | s3 |   s4 |  rhs
+------+------+----+----+----+------+----+------+-----
+x2    |  1/2 |  1 |  0 |  0 | -1/6 |  0 |  1/3 |   90
+x3    |  3/2 |  0 |  1 |  0 |  1/2 |  0 |    0 |  230
+s3    |   -1 |  0 |  0 |  0 |  2/3 |  1 | -4/3 |   60
+s1    | -3/2 |  0 |  0 |  1 | -1/6 |  0 | -2/3 |   20
+z     | 11/2 |  0 |  0 |  0 | 13/6 |  0 |  2/3 | 1330",
+        ],
+    );
+    let text = second.trace.to_string();
+    assert!(
+        text.starts_with("-> constraint 4 added as row 4 (violated by the current solution)"),
+        "{text}"
+    );
+    assert!(
+        text.contains("-> s4 leaves (row 4), s1 enters (pivot -3/2); ratios [s1: 2/3]"),
+        "{text}"
+    );
 }

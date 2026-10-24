@@ -13,6 +13,9 @@ course: no `0.9999999`, no hidden iterations.
 - **Exact arithmetic:** arbitrary-precision rationals (`num-rational`), so tableaus show `1/3`, not `0.333…`.
 - **Full trace:** every tableau snapshot, the entering/leaving variables, the minimum-ratio test,
   phase 1 results, artificial variables driven out of the basis and redundant rows removed.
+- **Sensitivity analysis** of every optimal solution: shadow prices, reduced costs, and the
+  ranges of right-hand sides and costs that keep the basis optimal, each price linked to the
+  tableau cell it is read from.
 - **Pivot rules:** Dantzig (textbook) or Bland (anti-cycling).
 - **Always conclusive:** every method reports optimal, infeasible or unbounded, and the trace
   says why.
@@ -71,6 +74,40 @@ z     |  0 |  0 |  0 |  3/2 |    1 |  36
 The text output is only a convenience: `solution.trace.steps` is a `Vec<Step>` you can walk
 to render the method in any UI.
 
+## Sensitivity analysis
+
+Every optimal solution comes with `solution.sensitivity`, read from the final basis and
+expressed in terms of the original problem. For Wyndor (`print!("{sensitivity}")`):
+
+```text
+constraint | shadow price | slack | rhs range | read from
+-----------+--------------+-------+-----------+----------
+#1         |            0 |     2 | [2, +inf) |        s1
+#2         |          3/2 |     0 |   [6, 18] |        s2
+#3         |            1 |     0 |  [12, 24] |        s3
+
+variable | value | reduced cost | cost range
+---------+-------+--------------+-----------
+x1       |     2 |            0 |  [0, 15/2]
+x2       |     6 |            0 |  [2, +inf)
+```
+
+- **Shadow price** `y_i = dz*/db_i`: how much the optimal objective changes per unit increase
+  of `b_i`, while `b_i` stays within its **rhs range**. This is the rate of change of `z`
+  itself, as in Hillier & Lieberman and Excel, also when minimizing (LINDO's "dual price" is
+  the improvement: the same when maximizing, negated when minimizing).
+- **Cost range:** the values of `c_j` for which the current solution stays optimal.
+- **Reduced cost:** `z_j - c_j` in the final tableau.
+- **Read from:** the objective-row cell that holds the price: under the slack (`<=`), the
+  negated surplus (`>=`) or, with Big-M, the artificial variable (`=`, constant part only).
+  The two-phase method drops artificial columns, so its equalities show `computed`.
+- `degenerate` and `alternative_optima` flag the cases where prices are one-sided or other
+  optima exist. Redundant equalities get a zero price, and they and the equalities they depend
+  on get a single-point rhs range (none can move alone).
+- With Big-M an artificial variable can be left in the basis at zero. The analysis then comes
+  from an equivalent optimal basis of the real problem (same solution, reached by degenerate
+  pivots), and `from_final_tableau` is `false`.
+
 ## JSON
 
 Enable the `serde` feature to send problems from a front end and get the whole trace back:
@@ -100,6 +137,7 @@ A solution carries its status at the top level, next to the trace. Each step has
 
 ```json
 { "status": "optimal", "objective": "17/5", "values": ["2/5", "9/5"],
+  "sensitivity": { "basis": [...], "constraints": [...], "variables": [...], ... },
   "trace": { "sense": "minimize", "steps": [ ... ] } }
 
 { "status": "infeasible", "trace": { ... } }
@@ -110,7 +148,13 @@ A solution carries its status at the top level, next to the trace. Each step has
   "ratios": [{ "row": 0, "ratio": "1" }, { "row": 1, "ratio": "3/2" }, { "row": 2, "ratio": "4" }] }
 
 { "type": "finished", "termination": "optimal" }
+
+{ "shadow_price": "3/2", "slack": "0", "binding": true,
+  "rhs_range": { "lower": "6", "upper": "18" }, "redundant": false,
+  "source": { "column": 3, "name": "s2", "negated": false } }
 ```
+
+Infinite range ends are `null`. The last object is one entry of `sensitivity.constraints`.
 
 Step types: `tableau`, `pivot`, `phase_one_finished`, `artificial_pivoted_out`,
 `redundant_row_removed`, `artificial_remains_positive`, `finished`. New types may appear in
@@ -150,13 +194,17 @@ match the textbook line by line:
   degenerate and redundant). Every recorded step is checked too: non-negative right-hand sides,
   unit basic columns, the entering column chosen by the pivot rule, the minimum-ratio leaving row,
   and that the final tableau is optimal under its own sense and shows the real objective value.
+- **Sensitivity:** textbook values (Wyndor, Taha), negative right-hand sides, redundant
+  equalities, degenerate Big-M bases. In the oracle, every report is checked for strong
+  duality, complementary slackness, dual feasibility and agreement with the final tableau,
+  and every range is probed by brute force: at its ends the objective must follow the
+  claimed slope, and just beyond them the basis must stop being optimal.
 - **JSON contract** (`--features serde`): exact round trips, and the shape of problems,
   statuses and steps is pinned by tests.
 
 ## Roadmap
 
-- Dual simplex
-- Sensitivity analysis (ranges, shadow prices) from the final tableau
+- Dual simplex, and with it adding a constraint or a variable after the optimum
 - Free (unrestricted-sign) variables
 
 ## License

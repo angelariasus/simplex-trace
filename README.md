@@ -82,6 +82,8 @@ problems.
   and the right-hand-side and cost ranges that keep the basis optimal.
 - **Post-optimality:** add constraints to a solved problem and repair the solution with dual
   simplex pivots from the final tableau, instead of solving again.
+- **Free and non-positive variables**, substituted as in the textbook (`x1 = x1+ - x1-`,
+  `x2 = -x2-`), with values and sensitivity reported for the original variables.
 - **Always conclusive:** every method reports optimal, infeasible or unbounded, and the trace
   explains why, including a diagnosis when Big-M proves infeasibility.
 - **Pivot rules:** Dantzig (the textbook rule) or Bland (anti-cycling).
@@ -94,11 +96,14 @@ problems.
 
 ```toml
 [dependencies]
-simplex-trace = "0.2"
+simplex-trace = "0.3"
 
 # Or, to (de)serialize problems, solutions and traces as JSON:
-# simplex-trace = { version = "0.2", features = ["serde"] }
+# simplex-trace = { version = "0.3", features = ["serde"] }
 ```
+
+Optional features: `serde` (JSON) and `num-interop` (conversions between `Rational` and
+`num_rational::BigRational`).
 
 ## Quick start
 
@@ -180,8 +185,33 @@ assert_eq!(problem.num_vars(), 2);
 assert_eq!(problem.var_name(0), "chairs");
 ```
 
-All variables are non-negative. Constraints with a negative right-hand side are normalized
-for you.
+Variables are non-negative unless declared otherwise. A free variable is split into two
+columns, `x1 = x1+ - x1-`, and a non-positive one becomes `x2 = -x2-`, exactly as in the
+textbook; the trace shows those columns, while values and sensitivity are reported for the
+original variables.
+
+```rust
+use simplex_trace::{solve, Method, Options, Problem, Relation, Status, ratio};
+
+// max 2x1 + x2  s.t.  x1 + x2 <= 4,  x1 <= 6,  x2 free
+let problem = Problem::maximize([2, 1])
+    .subject_to([1, 1], Relation::Le, 4)
+    .subject_to([1, 0], Relation::Le, 6)
+    .free(1);                                       // or .non_positive(j)
+let solution = solve(&problem, Method::Simplex, &Options::default()).unwrap();
+
+// The tableau has columns x1, x2+, x2-; the answer speaks about x2.
+assert_eq!(
+    solution.status,
+    Status::Optimal { objective: ratio(10, 1), values: vec![ratio(6, 1), ratio(-2, 1)] }
+);
+```
+
+Constraints with a negative right-hand side are normalized for you.
+
+Every number is a `Rational`: exact, in lowest terms, printed as `3/2`. Besides the usual
+arithmetic and comparisons it offers `to_f64()` for charts and `to_i64_parts()` to draw a
+stacked fraction.
 
 ### Choosing a method
 
@@ -387,7 +417,9 @@ otherwise). Run `cargo run --example dual` to see this and the dual simplex on T
 ### JSON
 
 With the `serde` feature, problems, solutions, traces and sensitivity reports are
-serializable. Numbers are always **exact strings** (`"3"`, `"-1/2"`); JSON floats are
+serializable. A problem may list `"signs"` (`"non_negative"`, `"free"`, `"non_positive"`,
+one per variable; omitted means all non-negative). Numbers are always **exact strings**
+(`"3"`, `"-1/2"`); JSON floats are
 rejected, so nothing is ever rounded on the way to or from a front end.
 
 ```rust,ignore
@@ -463,7 +495,12 @@ line by line:
   enters, which keeps the objective row optimal. A negative row with no negative entry proves
   the problem infeasible. The method never ends unbounded.
 - **Columns:** original variables, then slack and surplus (`s1`, `s2`, ...), then artificial
-  variables (`a1`, `a2`, ...), numbered by constraint.
+  variables (`a1`, `a2`, ...), numbered by constraint. A free variable takes two columns in
+  its place (`x1+`, `x1-`), a non-positive one a single column (`x2-`).
+- **Free variables in the sensitivity report:** a free variable's reduced cost is 0 at an
+  optimum (its two columns show `+-` it). It does not limit right-hand-side ranges, since it
+  may change sign (its twin column takes over with the same prices), and at zero it does not
+  make the basis degenerate.
 
 ## How it is tested
 
@@ -486,6 +523,9 @@ an independent source:
   incompatible). Results are compared with brute force; each dual pivot is checked against the
   leaving-row and ratio-test rules, every dual tableau must keep an optimal objective row, and
   the re-optimization must start from the previous final tableau.
+- **Free and non-positive variables:** 200 more problems with random sign restrictions run
+  through every method, re-optimization and sensitivity check, against a brute force that
+  works on the original variables (never on the split columns).
 - **Classic cases:** infeasible, unbounded, redundant equalities, negative right-hand sides
   and Beale's cycling example.
 - **JSON contract:** exact round trips, and the shape of every object is pinned by tests.
@@ -500,8 +540,6 @@ an independent source:
 - Exact arithmetic is much slower than floating point, and the full trace stores a copy of
   every tableau. The crate is meant for problems of classroom size (up to a few dozen
   variables and constraints), not for large models.
-- All variables must be non-negative. Free variables are on the roadmap; until then, split a
-  free variable as `x = x' - x''`.
 - Integer programming is out of scope.
 
 ## Minimum supported Rust version
@@ -515,8 +553,8 @@ It will only be raised in a minor release, with a note in the [changelog](CHANGE
 - [x] Sensitivity analysis
 - [x] JSON support
 - [x] Dual simplex, and adding constraints after the optimum
+- [x] Free and non-positive variables
 - [ ] Adding variables after the optimum (pricing the new column, then primal pivots)
-- [ ] Free (unrestricted-sign) variables
 - [ ] The artificial-constraint technique, for starts that are neither primal nor dual feasible
 
 ## Contributing

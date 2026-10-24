@@ -6,6 +6,27 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-24
+
+### Added
+
+- Free and non-positive variables: `Sign`, `Problem::free`, `Problem::non_positive`,
+  `Problem::with_sign` and `Problem::sign`, and an optional `"signs"` list in JSON. They are
+  substituted as in the textbook (`x1 = x1+ - x1-`, `x2 = -x2-`); the trace shows the split
+  columns, values and the sensitivity report speak about the original variables. Works with
+  every method and with `reoptimize`.
+- `Rational::to_f64`, `Rational::to_i64_parts`, `Rational::new`, `From<i32>`, `From<i64>`,
+  and `ParseRationalError`.
+- `num-interop` feature: conversions between `Rational` and `num_rational::BigRational`.
+
+### Changed
+
+- `Rational` is its own type instead of an alias of `num_rational::BigRational`, so a new
+  num-rational version no longer breaks the API. Methods from num-rational and num-traits are
+  not available on it; use the inherent methods or `num-interop`. `Debug` prints `3/2`. The
+  JSON format is unchanged, and so is performance.
+- Variable names ending in `+` or `-` are rejected: they are the names of split columns.
+
 ## [0.2.0] - 2026-10-24
 
 ### Added
@@ -50,6 +71,7 @@ First release.
 - Optional `serde` feature: problems, solutions and traces as JSON, with numbers as exact
   strings.
 
-[Unreleased]: https://github.com/angelariasus/simplex-trace/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/angelariasus/simplex-trace/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/angelariasus/simplex-trace/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/angelariasus/simplex-trace/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/angelariasus/simplex-trace/releases/tag/v0.1.0

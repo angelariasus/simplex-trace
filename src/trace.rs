@@ -4,9 +4,12 @@ use crate::num::{Coef, Rational};
 use crate::problem::Sense;
 
 /// Stage of the algorithm a step belongs to.
+///
+/// New stages (for example from future methods) may be added in minor releases.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Phase {
     /// Plain simplex or Big-M: one optimization.
     Single,

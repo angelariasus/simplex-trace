@@ -6,11 +6,14 @@
 //! non-decreasing (when maximizing) function of `K`, so it stays the same for both values exactly
 //! when the original problem is bounded, and changes exactly when it is unbounded. `K` is far
 //! larger than any vertex the generators can produce.
+//!
+//! The sensitivity analysis is checked the same way: every claimed range is probed by solving
+//! perturbed problems with brute force, at its ends and just beyond them.
 
 use num_traits::{Signed, Zero};
 use simplex_trace::{
-    Error, Method, Options, Phase, PivotRule, Problem, Rational, Relation, Sense, Snapshot,
-    Solution, Status, Step, Termination, ratio, solve,
+    Error, Interval, Method, Options, Phase, PivotRule, Problem, Rational, Relation, Sense,
+    Sensitivity, Snapshot, Solution, Status, Step, Termination, ratio, solve,
 };
 
 const CASES: usize = 600;
@@ -204,6 +207,17 @@ fn reference(problem: &Problem) -> Expected {
     }
 }
 
+/// [`reference`] for a problem that cannot be unbounded, so one box is enough: one whose
+/// right-hand sides were changed from a problem with an optimum (unboundedness depends only
+/// on the recession directions, which do not depend on the right-hand sides).
+fn reference_bounded(problem: &Problem) -> Expected {
+    let n = problem.num_vars();
+    match best_vertex(&problem.clone().subject_to(vec![1; n], Relation::Le, BIG_K)) {
+        Some(v) => Expected::Optimal(v),
+        None => Expected::Infeasible,
+    }
+}
+
 #[derive(Debug, Default)]
 struct Stats {
     optimal: usize,
@@ -216,6 +230,260 @@ struct Stats {
     redundant_rows: usize,
     big_m_infeasible_at_optimum: usize,
     big_m_infeasible_at_ray: usize,
+    sensitivity_reports: usize,
+    sensitivity_rebased: usize,
+    degenerate_bases: usize,
+    alternative_optima: usize,
+    redundant_constraints: usize,
+    pinned_constraints: usize,
+    range_probes: usize,
+    strict_probes_beyond: usize,
+}
+
+/// Checks the sensitivity report of an optimal solution: its duality relations against the
+/// final tableau, then (once per distinct report) every range by brute force: at its finite
+/// ends (or a step into an infinite one) the objective must follow the claimed slope, and
+/// just beyond an end the current basis must stop being optimal. The last check is only
+/// sharp without dual degeneracy (right-hand sides) or primal degeneracy (costs).
+#[allow(clippy::too_many_arguments)]
+fn check_sensitivity(
+    problem: &Problem,
+    method: Method,
+    solution: &Solution,
+    objective: &Rational,
+    values: &[Rational],
+    seen: &mut Vec<Sensitivity>,
+    stats: &mut Stats,
+    ctx: &str,
+) {
+    let n = problem.num_vars();
+    let last = solution.trace.tableaus().last().unwrap();
+    let is_artificial = |j: usize| j >= n && last.columns[j].starts_with('a');
+    let redundant_row =
+        |i: usize| (0..last.columns.len()).all(|j| is_artificial(j) || last.rows[i][j].is_zero());
+
+    let s = solution
+        .sensitivity
+        .as_ref()
+        .expect("optimal solutions have a sensitivity report");
+    stats.sensitivity_reports += 1;
+    // Only Big-M may leave an artificial in the basis, and only that forces another basis.
+    let stuck_artificial =
+        (0..last.rows.len()).any(|i| is_artificial(last.basis[i]) && !redundant_row(i));
+    assert_eq!(s.from_final_tableau, !stuck_artificial, "{ctx}");
+    assert!(!stuck_artificial || method == Method::BigM, "{ctx}");
+    // From the final tableau: its cells must agree with the report.
+    let tableau = s.from_final_tableau.then_some(last);
+    if let Some(last) = tableau {
+        let names: Vec<&String> = last
+            .basis
+            .iter()
+            .filter(|&&b| !is_artificial(b))
+            .map(|&b| &last.columns[b])
+            .collect();
+        assert_eq!(s.basis.iter().collect::<Vec<_>>(), names, "{ctx}: basis");
+    } else {
+        stats.sensitivity_rebased += 1;
+    }
+    assert_eq!(s.variables.len(), n, "{ctx}");
+    assert_eq!(s.constraints.len(), problem.constraints.len(), "{ctx}");
+    let maximize = problem.sense == Sense::Maximize;
+    let y: Vec<&Rational> = s.constraints.iter().map(|c| &c.shadow_price).collect();
+
+    // Variables: values, basis, reduced costs (from the duals and from the tableau).
+    for (j, v) in s.variables.iter().enumerate() {
+        assert_eq!(v.name, problem.var_name(j), "{ctx}");
+        assert_eq!(v.value, values[j], "{ctx}: value of x{}", j + 1);
+        assert_eq!(
+            v.basic,
+            s.basis.contains(&v.name),
+            "{ctx}: basic flag of x{}",
+            j + 1
+        );
+        let d: Rational = problem
+            .constraints
+            .iter()
+            .zip(&y)
+            .map(|(c, y)| &c.coeffs[j] * *y)
+            .sum::<Rational>()
+            - &problem.objective[j];
+        assert_eq!(v.reduced_cost, d, "{ctx}: reduced cost of x{}", j + 1);
+        if let Some(last) = tableau {
+            assert_eq!(v.reduced_cost, last.z[j].c, "{ctx}: tableau reduced cost");
+            assert!(last.z[j].m.is_zero(), "{ctx}");
+        }
+        assert!(!v.basic || d.is_zero(), "{ctx}");
+        assert!(v.basic || v.value.is_zero(), "{ctx}");
+        let dual_feasible = if maximize {
+            !d.is_negative()
+        } else {
+            !d.is_positive()
+        };
+        assert!(dual_feasible, "{ctx}: dual infeasible");
+        assert!(v.cost_range.contains(&problem.objective[j]), "{ctx}");
+    }
+
+    // Constraints: slack, sign of the dual, complementary slackness, where to read it.
+    let has_artificial_columns = (0..last.columns.len()).any(is_artificial);
+    for (i, (c, cs)) in problem.constraints.iter().zip(&s.constraints).enumerate() {
+        let activity: Rational = c.coeffs.iter().zip(values).map(|(a, x)| a * x).sum();
+        let slack = match c.relation {
+            Relation::Le => &c.rhs - &activity,
+            Relation::Ge => &activity - &c.rhs,
+            Relation::Eq => Rational::zero(),
+        };
+        assert_eq!(cs.slack, slack, "{ctx}: slack of #{}", i + 1);
+        assert!(!slack.is_negative(), "{ctx}");
+        assert_eq!(cs.binding, slack.is_zero(), "{ctx}");
+        let price = &cs.shadow_price;
+        let sign_ok = match (c.relation, maximize) {
+            (Relation::Eq, _) => true,
+            (Relation::Le, true) | (Relation::Ge, false) => !price.is_negative(),
+            (Relation::Ge, true) | (Relation::Le, false) => !price.is_positive(),
+        };
+        assert!(sign_ok, "{ctx}: shadow price sign of #{}", i + 1);
+        assert!(
+            price.is_zero() || slack.is_zero(),
+            "{ctx}: complementary slackness"
+        );
+        assert!(cs.rhs_range.contains(&c.rhs), "{ctx}");
+        assert!(!cs.redundant || price.is_zero(), "{ctx}");
+        match &cs.source {
+            Some(_) if tableau.is_none() => panic!("{ctx}: source without the final tableau"),
+            None if tableau.is_none() => {}
+            Some(src) => {
+                let cell = &last.z[src.column];
+                assert_eq!(last.columns[src.column], src.name, "{ctx}");
+                let read = if src.negated {
+                    -cell.c.clone()
+                } else {
+                    cell.c.clone()
+                };
+                assert_eq!(&read, price, "{ctx}: #{} vs cell {}", i + 1, src.name);
+                assert!(is_artificial(src.column) || cell.m.is_zero(), "{ctx}");
+            }
+            None => assert!(
+                cs.redundant || (c.relation == Relation::Eq && !has_artificial_columns),
+                "{ctx}: no source for #{}",
+                i + 1
+            ),
+        }
+        stats.redundant_constraints += cs.redundant as usize;
+        stats.pinned_constraints +=
+            (!cs.redundant && cs.rhs_range.lower == cs.rhs_range.upper) as usize;
+    }
+
+    // Strong duality, and the flags against the final tableau.
+    let dual_objective: Rational = problem
+        .constraints
+        .iter()
+        .zip(&y)
+        .map(|(c, y)| &c.rhs * *y)
+        .sum();
+    assert_eq!(&dual_objective, objective, "{ctx}: strong duality");
+    if let Some(last) = tableau {
+        let degenerate =
+            (0..last.rows.len()).any(|i| !is_artificial(last.basis[i]) && last.rhs[i].is_zero());
+        assert_eq!(s.degenerate, degenerate, "{ctx}: degenerate flag");
+        let alternative = (0..last.columns.len())
+            .any(|j| !is_artificial(j) && !last.basis.contains(&j) && last.z[j].is_zero());
+        assert_eq!(
+            s.alternative_optima, alternative,
+            "{ctx}: alternative optima flag"
+        );
+    } else {
+        // An artificial stuck at zero in the basis means the solution is degenerate.
+        assert!(s.degenerate, "{ctx}");
+    }
+    stats.degenerate_bases += s.degenerate as usize;
+    stats.alternative_optima += s.alternative_optima as usize;
+
+    if seen.contains(s) {
+        return;
+    }
+    seen.push(s.clone());
+    let step = ratio(7, 1);
+    let one = ratio(1, 1);
+    // The finite ends of a range, or a step into an infinite one.
+    let probes = |current: &Rational, range: &Interval| -> [Rational; 2] {
+        [
+            range.lower.clone().unwrap_or_else(|| current - &step),
+            range.upper.clone().unwrap_or_else(|| current + &step),
+        ]
+    };
+    let beyond = |range: &Interval| -> Vec<Rational> {
+        [
+            range.lower.as_ref().map(|l| l - &one),
+            range.upper.as_ref().map(|u| u + &one),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    };
+    // `better(a, b)`: `a` is a strictly better objective value than `b`.
+    let better = |a: &Rational, b: &Rational| if maximize { a > b } else { a < b };
+
+    for (i, (c, cs)) in problem.constraints.iter().zip(&s.constraints).enumerate() {
+        let at = |b: &Rational| {
+            let mut p = problem.clone();
+            p.constraints[i].rhs = b.clone();
+            reference_bounded(&p)
+        };
+        let linear = |b: &Rational| objective + &cs.shadow_price * (b - &c.rhs);
+        for b in probes(&c.rhs, &cs.rhs_range) {
+            let want = Expected::Optimal(linear(&b));
+            assert_eq!(at(&b), want, "{ctx}: #{} at b = {b}", i + 1);
+            stats.range_probes += 1;
+        }
+        if s.alternative_optima {
+            continue;
+        }
+        for b in beyond(&cs.rhs_range) {
+            match at(&b) {
+                Expected::Infeasible => {}
+                Expected::Optimal(v) => assert!(
+                    better(&linear(&b), &v),
+                    "{ctx}: #{} beyond its range at b = {b}: {v} vs {}",
+                    i + 1,
+                    linear(&b)
+                ),
+                Expected::Unbounded => unreachable!(),
+            }
+            stats.strict_probes_beyond += 1;
+        }
+    }
+
+    for (j, v) in s.variables.iter().enumerate() {
+        let cj = &problem.objective[j];
+        let at = |c: &Rational| {
+            let mut p = problem.clone();
+            p.objective[j] = c.clone();
+            reference(&p)
+        };
+        // The current solution's value under the new cost.
+        let current = |c: &Rational| objective + (c - cj) * &values[j];
+        for c in probes(cj, &v.cost_range) {
+            let want = Expected::Optimal(current(&c));
+            assert_eq!(at(&c), want, "{ctx}: x{} at c = {c}", j + 1);
+            stats.range_probes += 1;
+        }
+        if s.degenerate {
+            continue;
+        }
+        for c in beyond(&v.cost_range) {
+            match at(&c) {
+                Expected::Unbounded => {}
+                Expected::Optimal(best) => assert!(
+                    better(&best, &current(&c)),
+                    "{ctx}: x{} beyond its range at c = {c}: {best} vs {}",
+                    j + 1,
+                    current(&c)
+                ),
+                Expected::Infeasible => panic!("{ctx}: changing a cost made it infeasible"),
+            }
+            stats.strict_probes_beyond += 1;
+        }
+    }
 }
 
 /// Checks every step of the trace against the textbook rules.
@@ -378,6 +646,7 @@ fn matches_brute_force_on_random_problems() {
             random_general(&mut rng)
         };
         let expected = reference(&problem);
+        let mut seen = Vec::new();
         match expected {
             Expected::Optimal(_) => stats.optimal += 1,
             Expected::Infeasible => stats.infeasible += 1,
@@ -433,9 +702,15 @@ fn matches_brute_force_on_random_problems() {
                         assert!(last.is_optimal(), "{ctx}: final tableau not optimal");
                         assert!(last.z_rhs.m.is_zero(), "{ctx}: M left in objective");
                         assert_eq!(&last.z_rhs.c, best, "{ctx}: tableau objective");
+                        check_sensitivity(
+                            &problem, method, &solution, objective, values, &mut seen, &mut stats,
+                            &ctx,
+                        );
                     }
                     (Status::Infeasible, Expected::Infeasible)
-                    | (Status::Unbounded, Expected::Unbounded) => {}
+                    | (Status::Unbounded, Expected::Unbounded) => {
+                        assert!(solution.sensitivity.is_none(), "{ctx}");
+                    }
                     (got, want) => panic!("{ctx}: got {got:?}, want {want:?}"),
                 }
             }
@@ -453,4 +728,11 @@ fn matches_brute_force_on_random_problems() {
     assert!(stats.redundant_rows >= 5, "{stats:#?}");
     assert!(stats.big_m_infeasible_at_optimum >= 20, "{stats:#?}");
     assert!(stats.big_m_infeasible_at_ray >= 5, "{stats:#?}");
+    assert!(stats.sensitivity_reports >= 1000, "{stats:#?}");
+    assert!(stats.degenerate_bases >= 100, "{stats:#?}");
+    assert!(stats.alternative_optima >= 50, "{stats:#?}");
+    assert!(stats.redundant_constraints >= 5, "{stats:#?}");
+    assert!(stats.pinned_constraints >= 5, "{stats:#?}");
+    assert!(stats.strict_probes_beyond >= 1000, "{stats:#?}");
+    assert!(stats.sensitivity_rebased >= 10, "{stats:#?}");
 }

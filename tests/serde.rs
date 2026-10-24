@@ -251,3 +251,47 @@ fn rejects_inexact_or_invalid_numbers() {
     let err = problem(r#"["1/0"]"#).unwrap_err().to_string();
     assert!(err.contains("invalid rational \"1/0\""), "{err}");
 }
+
+#[test]
+fn sensitivity_format() {
+    // Wyndor Glass Co.
+    let problem = Problem::maximize([3, 5])
+        .subject_to([1, 0], Relation::Le, 4)
+        .subject_to([0, 2], Relation::Le, 12)
+        .subject_to([3, 2], Relation::Le, 18);
+    let solution = solve(&problem, Method::Simplex, &Options::default()).unwrap();
+    let value = to_value(&solution);
+    let s = &value["sensitivity"];
+    assert_eq!(s["basis"], json!(["s1", "x2", "x1"]));
+    assert_eq!(s["from_final_tableau"], json!(true));
+    assert_eq!(s["degenerate"], json!(false));
+    assert_eq!(s["alternative_optima"], json!(false));
+    assert_eq!(
+        s["constraints"][0],
+        json!({
+            "shadow_price": "0",
+            "slack": "2",
+            "binding": false,
+            "rhs_range": { "lower": "2", "upper": null },
+            "redundant": false,
+            "source": { "column": 2, "name": "s1", "negated": false }
+        })
+    );
+    assert_eq!(
+        s["variables"][0],
+        json!({
+            "name": "x1",
+            "value": "2",
+            "basic": true,
+            "reduced_cost": "0",
+            "cost_range": { "lower": "0", "upper": "15/2" }
+        })
+    );
+    // Two-phase drops the artificial columns, so an equality has no cell to read from.
+    let solution = solve(&taha(), Method::TwoPhase, &Options::default()).unwrap();
+    let value = to_value(&solution);
+    assert_eq!(
+        value["sensitivity"]["constraints"][0]["source"],
+        json!(null)
+    );
+}

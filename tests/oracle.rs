@@ -149,18 +149,20 @@ fn best_vertex(problem: &Problem) -> Option<Rational> {
     combinations(planes.len(), n, 0, &mut chosen, &mut |idx| {
         let a = idx.iter().map(|&k| planes[k].0.clone()).collect();
         let b = idx.iter().map(|&k| planes[k].1.clone()).collect();
-        if let Some(x) = solve_square(a, b)
-            && feasible(problem, &x)
-        {
-            let value: Rational = problem.objective.iter().zip(&x).map(|(c, v)| c * v).sum();
-            let better = match (&best, problem.sense) {
-                (None, _) => true,
-                (Some(b), Sense::Maximize) => value > *b,
-                (Some(b), Sense::Minimize) => value < *b,
-            };
-            if better {
-                best = Some(value);
-            }
+        let Some(x) = solve_square(a, b) else {
+            return;
+        };
+        if !feasible(problem, &x) {
+            return;
+        }
+        let value: Rational = problem.objective.iter().zip(&x).map(|(c, v)| c * v).sum();
+        let better = match (&best, problem.sense) {
+            (None, _) => true,
+            (Some(b), Sense::Maximize) => value > *b,
+            (Some(b), Sense::Minimize) => value < *b,
+        };
+        if better {
+            best = Some(value);
         }
     });
     best

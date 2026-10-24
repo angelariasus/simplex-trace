@@ -1,12 +1,20 @@
-//! Cross-checks the solver against brute-force vertex enumeration on random small problems.
+//! Cross-checks the solver against brute-force vertex enumeration on random problems, and
+//! checks the invariants of every recorded step, not only the final answer.
 //!
-//! Every generated problem includes `x1 + ... + xn <= 10`, so a non-empty feasible region is a
-//! bounded polytope and its optimum is attained at a vertex.
+//! Reference answer: the problem is solved by enumerating the vertices of its intersection with
+//! the box `x1 + ... + xn <= K`, for two huge values of `K`. The boxed optimum is a concave,
+//! non-decreasing (when maximizing) function of `K`, so it stays the same for both values exactly
+//! when the original problem is bounded, and changes exactly when it is unbounded. `K` is far
+//! larger than any vertex the generators can produce.
 
 use num_traits::{Signed, Zero};
 use simplex_trace::{
-    Method, Options, PivotRule, Problem, Rational, Relation, Status, ratio, solve,
+    Error, Method, Options, Phase, PivotRule, Problem, Rational, Relation, Sense, Snapshot,
+    Solution, Status, Step, Termination, ratio, solve,
 };
+
+const CASES: usize = 600;
+const BIG_K: i64 = 1_000_000_000;
 
 /// Small deterministic xorshift generator, so failures are reproducible without extra deps.
 struct Rng(u64);
@@ -22,27 +30,69 @@ impl Rng {
     fn range(&mut self, lo: i64, hi: i64) -> i64 {
         lo + (self.next() % (hi - lo + 1) as u64) as i64
     }
+
+    fn chance(&mut self, percent: u64) -> bool {
+        self.next() % 100 < percent
+    }
 }
 
-fn random_problem(rng: &mut Rng) -> Problem {
-    let n = rng.range(2, 3) as usize;
-    let objective: Vec<i64> = (0..n).map(|_| rng.range(-5, 5)).collect();
-    let mut problem = if rng.range(0, 1) == 0 {
+fn random_sense(rng: &mut Rng, objective: Vec<i64>) -> Problem {
+    if rng.chance(50) {
         Problem::maximize(objective)
     } else {
         Problem::minimize(objective)
-    };
-    problem = problem.subject_to(vec![1; n], Relation::Le, 10);
-    for _ in 0..rng.range(1, 3) {
-        let coeffs: Vec<i64> = (0..n).map(|_| rng.range(-3, 4)).collect();
-        let relation = match rng.range(0, 2) {
-            0 => Relation::Le,
-            1 => Relation::Ge,
-            _ => Relation::Eq,
+    }
+}
+
+/// Any mix of `<=`, `>=`, `=`, negative and zero right-hand sides, and scaled copies of earlier
+/// constraints (redundant rows, degenerate vertices). May be infeasible or unbounded.
+fn random_general(rng: &mut Rng) -> Problem {
+    let n = rng.range(2, 4) as usize;
+    let objective = (0..n).map(|_| rng.range(-5, 5)).collect();
+    let mut problem = random_sense(rng, objective);
+    let mut previous: Vec<(Vec<i64>, Relation, i64)> = Vec::new();
+    for _ in 0..rng.range(1, 4) {
+        let constraint = if !previous.is_empty() && rng.chance(15) {
+            let k = rng.range(0, previous.len() as i64 - 1) as usize;
+            let (coeffs, relation, rhs) = previous[k].clone();
+            (coeffs.iter().map(|v| 2 * v).collect(), relation, 2 * rhs)
+        } else {
+            let coeffs = (0..n).map(|_| rng.range(-3, 4)).collect();
+            let relation = match rng.range(0, 2) {
+                0 => Relation::Le,
+                1 => Relation::Ge,
+                _ => Relation::Eq,
+            };
+            let rhs = if rng.chance(20) { 0 } else { rng.range(-4, 12) };
+            (coeffs, relation, rhs)
         };
-        problem = problem.subject_to(coeffs, relation, rng.range(-4, 12));
+        previous.push(constraint.clone());
+        problem = problem.subject_to(constraint.0, constraint.1, constraint.2);
     }
     problem
+}
+
+/// Only `<=` constraints with a non-negative right-hand side: solvable by plain simplex.
+/// Always feasible (the origin); may be unbounded or degenerate.
+fn random_slack_only(rng: &mut Rng) -> Problem {
+    let n = rng.range(2, 4) as usize;
+    let objective = (0..n).map(|_| rng.range(-5, 5)).collect();
+    let mut problem = random_sense(rng, objective);
+    for _ in 0..rng.range(1, 4) {
+        let coeffs: Vec<i64> = (0..n).map(|_| rng.range(-2, 5)).collect();
+        let rhs = if rng.chance(25) { 0 } else { rng.range(1, 12) };
+        problem = problem.subject_to(coeffs, Relation::Le, rhs);
+    }
+    problem
+}
+
+/// Whether the standard form of `problem` has an artificial variable.
+fn needs_artificials(problem: &Problem) -> bool {
+    problem.constraints.iter().any(|c| match c.relation {
+        Relation::Eq => true,
+        Relation::Le => c.rhs.is_negative(),
+        Relation::Ge => !c.rhs.is_negative(),
+    })
 }
 
 /// Solves the square system `a x = b` exactly; `None` if singular.
@@ -80,7 +130,7 @@ fn feasible(problem: &Problem, x: &[Rational]) -> bool {
 }
 
 /// Best objective over all basic feasible solutions, or `None` if there are none.
-fn brute_force(problem: &Problem) -> Option<Rational> {
+fn best_vertex(problem: &Problem) -> Option<Rational> {
     let n = problem.num_vars();
     // Hyperplanes: every constraint, plus x_j = 0 for each variable.
     let mut planes: Vec<(Vec<Rational>, Rational)> = problem
@@ -105,8 +155,8 @@ fn brute_force(problem: &Problem) -> Option<Rational> {
             let value: Rational = problem.objective.iter().zip(&x).map(|(c, v)| c * v).sum();
             let better = match (&best, problem.sense) {
                 (None, _) => true,
-                (Some(b), simplex_trace::Sense::Maximize) => value > *b,
-                (Some(b), simplex_trace::Sense::Minimize) => value < *b,
+                (Some(b), Sense::Maximize) => value > *b,
+                (Some(b), Sense::Minimize) => value < *b,
             };
             if better {
                 best = Some(value);
@@ -134,59 +184,229 @@ fn combinations(
     }
 }
 
+#[derive(Debug, PartialEq)]
+enum Expected {
+    Optimal(Rational),
+    Infeasible,
+    Unbounded,
+}
+
+fn reference(problem: &Problem) -> Expected {
+    let n = problem.num_vars();
+    let boxed = |k: i64| best_vertex(&problem.clone().subject_to(vec![1; n], Relation::Le, k));
+    match (boxed(BIG_K), boxed(2 * BIG_K)) {
+        (None, None) => Expected::Infeasible,
+        (Some(a), Some(b)) if a == b => Expected::Optimal(a),
+        (Some(_), Some(_)) => Expected::Unbounded,
+        (a, b) => panic!("BIG_K too small: {a:?} vs {b:?}\n{problem:?}"),
+    }
+}
+
+#[derive(Debug, Default)]
+struct Stats {
+    optimal: usize,
+    infeasible: usize,
+    unbounded: usize,
+    simplex_runs: usize,
+    pivots: usize,
+    degenerate_pivots: usize,
+    artificial_swaps: usize,
+    redundant_rows: usize,
+    big_m_inconclusive_infeasible: usize,
+    big_m_inconclusive_unbounded: usize,
+}
+
+/// Checks every step of the trace against the textbook rules.
+fn check_trace(
+    problem: &Problem,
+    rule: PivotRule,
+    solution: &Solution,
+    stats: &mut Stats,
+    ctx: &str,
+) {
+    let mut current: Option<&Snapshot> = None;
+    for step in &solution.trace.steps {
+        match step {
+            Step::Tableau {
+                phase, snapshot, ..
+            } => {
+                let (sense, label) = match phase {
+                    Phase::One => (Sense::Minimize, "r"),
+                    _ => (problem.sense, "z"),
+                };
+                assert_eq!(snapshot.sense, sense, "{ctx}");
+                assert_eq!(snapshot.objective_label, label, "{ctx}");
+                assert!(
+                    snapshot.rhs.iter().all(|b| !b.is_negative()),
+                    "{ctx}: negative rhs (lost primal feasibility)"
+                );
+                for (i, &b) in snapshot.basis.iter().enumerate() {
+                    assert!(
+                        snapshot.z[b].is_zero(),
+                        "{ctx}: basic column {b} has z_j - c_j != 0"
+                    );
+                    for (k, row) in snapshot.rows.iter().enumerate() {
+                        let unit = if k == i { ratio(1, 1) } else { ratio(0, 1) };
+                        assert_eq!(row[b], unit, "{ctx}: basic column {b} is not a unit vector");
+                    }
+                }
+                current = Some(snapshot);
+            }
+            Step::Pivot {
+                entering,
+                leaving_row,
+                leaving,
+                pivot_value,
+                ratios,
+                ..
+            } => {
+                let t = current.expect("pivot before any tableau");
+                let improves = |j: usize| match t.sense {
+                    Sense::Maximize => t.z[j].is_negative(),
+                    Sense::Minimize => t.z[j].is_positive(),
+                };
+                let candidates: Vec<usize> = (0..t.z.len()).filter(|&j| improves(j)).collect();
+                assert!(
+                    improves(*entering),
+                    "{ctx}: entering column does not improve"
+                );
+                match rule {
+                    PivotRule::Bland => assert_eq!(*entering, candidates[0], "{ctx}: Bland"),
+                    PivotRule::Dantzig => {
+                        let values = candidates.iter().map(|&j| &t.z[j]);
+                        let best = match t.sense {
+                            Sense::Maximize => values.min(),
+                            Sense::Minimize => values.max(),
+                        };
+                        assert_eq!(Some(&t.z[*entering]), best, "{ctx}: Dantzig");
+                    }
+                }
+
+                assert_eq!(ratios.len(), t.rows.len(), "{ctx}");
+                for (i, r) in ratios.iter().enumerate() {
+                    assert_eq!(r.row, i, "{ctx}");
+                    let a = &t.rows[i][*entering];
+                    let want = a.is_positive().then(|| &t.rhs[i] / a);
+                    assert_eq!(r.ratio, want, "{ctx}: ratio test row {i}");
+                }
+                let min = ratios.iter().filter_map(|r| r.ratio.clone()).min().unwrap();
+                assert_eq!(
+                    ratios[*leaving_row].ratio.as_ref(),
+                    Some(&min),
+                    "{ctx}: not the minimum ratio"
+                );
+                assert_eq!(*leaving, t.basis[*leaving_row], "{ctx}");
+                assert_eq!(pivot_value, &t.rows[*leaving_row][*entering], "{ctx}");
+
+                stats.pivots += 1;
+                if min.is_zero() {
+                    stats.degenerate_pivots += 1;
+                }
+            }
+            Step::ArtificialPivotedOut { .. } => stats.artificial_swaps += 1,
+            Step::RedundantRowRemoved { .. } => stats.redundant_rows += 1,
+            Step::PhaseOneFinished { .. } | Step::Finished(_) => {}
+        }
+    }
+
+    let termination = match solution.status {
+        Status::Optimal { .. } => Termination::Optimal,
+        Status::Infeasible => Termination::Infeasible,
+        Status::Unbounded => Termination::Unbounded,
+    };
+    assert_eq!(
+        solution.trace.steps.last(),
+        Some(&Step::Finished(termination)),
+        "{ctx}"
+    );
+}
+
 #[test]
 fn matches_brute_force_on_random_problems() {
     let mut rng = Rng(0x5EED_1234_ABCD_0001);
-    let (mut optimal, mut infeasible) = (0, 0);
+    let mut stats = Stats::default();
 
-    for case in 0..500 {
-        let problem = random_problem(&mut rng);
-        let expected = brute_force(&problem);
+    for case in 0..CASES {
+        let problem = if case % 3 == 0 {
+            random_slack_only(&mut rng)
+        } else {
+            random_general(&mut rng)
+        };
+        let expected = reference(&problem);
+        match expected {
+            Expected::Optimal(_) => stats.optimal += 1,
+            Expected::Infeasible => stats.infeasible += 1,
+            Expected::Unbounded => stats.unbounded += 1,
+        }
 
-        for method in [Method::TwoPhase, Method::BigM] {
+        for method in [Method::Simplex, Method::BigM, Method::TwoPhase] {
             for rule in [PivotRule::Dantzig, PivotRule::Bland] {
+                let ctx = format!("case {case} {method:?} {rule:?}\n{problem:?}");
                 let options = Options {
                     pivot_rule: rule,
                     ..Options::default()
                 };
-                let solution = solve(&problem, method, &options).unwrap_or_else(|e| {
-                    panic!("case {case} {method:?} {rule:?}: {e}\n{problem:?}")
-                });
+                let solution = match solve(&problem, method, &options) {
+                    Ok(solution) => solution,
+                    Err(Error::ArtificialVariablesRequired) if method == Method::Simplex => {
+                        assert!(needs_artificials(&problem), "{ctx}");
+                        continue;
+                    }
+                    // Big-M may legitimately be unable to decide; it can only happen when the
+                    // problem has no finite optimum.
+                    Err(Error::Inconclusive) if method == Method::BigM => {
+                        match expected {
+                            Expected::Optimal(_) => panic!("{ctx}: Big-M inconclusive"),
+                            Expected::Infeasible => stats.big_m_inconclusive_infeasible += 1,
+                            Expected::Unbounded => stats.big_m_inconclusive_unbounded += 1,
+                        }
+                        continue;
+                    }
+                    Err(e) => panic!("{ctx}: {e}"),
+                };
+                if method == Method::Simplex {
+                    assert!(!needs_artificials(&problem), "{ctx}");
+                    stats.simplex_runs += 1;
+                }
+
+                check_trace(&problem, rule, &solution, &mut stats, &ctx);
+
                 match (&solution.status, &expected) {
-                    (Status::Optimal { objective, values }, Some(best)) => {
-                        assert_eq!(
-                            objective, best,
-                            "case {case} {method:?} {rule:?}\n{problem:?}"
-                        );
+                    (Status::Optimal { objective, values }, Expected::Optimal(best)) => {
+                        assert_eq!(objective, best, "{ctx}");
                         assert!(
                             feasible(&problem, values),
-                            "case {case}: infeasible point {values:?}"
+                            "{ctx}: infeasible point {values:?}"
                         );
+                        let value: Rational = problem
+                            .objective
+                            .iter()
+                            .zip(values)
+                            .map(|(c, v)| c * v)
+                            .sum();
+                        assert_eq!(&value, best, "{ctx}: values do not attain the objective");
                         // The final tableau speaks the problem's own sense and value.
                         let last = solution.trace.tableaus().last().unwrap();
-                        assert_eq!(last.sense, problem.sense, "case {case}");
-                        assert!(last.is_optimal(), "case {case}: final tableau not optimal");
-                        assert!(last.z_rhs.m.is_zero(), "case {case}: M left in objective");
-                        assert_eq!(&last.z_rhs.c, best, "case {case}: tableau objective");
+                        assert_eq!(last.sense, problem.sense, "{ctx}");
+                        assert!(last.is_optimal(), "{ctx}: final tableau not optimal");
+                        assert!(last.z_rhs.m.is_zero(), "{ctx}: M left in objective");
+                        assert_eq!(&last.z_rhs.c, best, "{ctx}: tableau objective");
                     }
-                    (Status::Infeasible, None) => {}
-                    (got, want) => panic!(
-                        "case {case} {method:?} {rule:?}: got {got:?}, want {want:?}\n{problem:?}"
-                    ),
+                    (Status::Infeasible, Expected::Infeasible)
+                    | (Status::Unbounded, Expected::Unbounded) => {}
+                    (got, want) => panic!("{ctx}: got {got:?}, want {want:?}"),
                 }
             }
         }
-
-        if expected.is_some() {
-            optimal += 1
-        } else {
-            infeasible += 1
-        }
     }
 
-    // Make sure the generator actually exercises both outcomes.
-    assert!(
-        optimal > 100 && infeasible > 20,
-        "optimal={optimal} infeasible={infeasible}"
-    );
+    eprintln!("{stats:#?}");
+    // Make sure the generators actually exercise every outcome and the tricky paths.
+    assert!(stats.optimal >= 150, "{stats:#?}");
+    assert!(stats.infeasible >= 50, "{stats:#?}");
+    assert!(stats.unbounded >= 50, "{stats:#?}");
+    assert!(stats.simplex_runs >= 300, "{stats:#?}");
+    assert!(stats.degenerate_pivots >= 100, "{stats:#?}");
+    assert!(stats.artificial_swaps >= 5, "{stats:#?}");
+    assert!(stats.redundant_rows >= 5, "{stats:#?}");
 }

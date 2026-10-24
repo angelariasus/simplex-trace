@@ -32,6 +32,8 @@
 //! }
 //! ```
 
+#![forbid(unsafe_code)]
+
 mod error;
 mod num;
 mod problem;

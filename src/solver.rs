@@ -1,5 +1,3 @@
-use num_traits::{One, Signed, Zero};
-
 use crate::error::Error;
 use crate::num::{Coef, Rational};
 use crate::problem::{Problem, Relation, Sense};
@@ -95,9 +93,7 @@ impl Options {
 pub enum Status {
     /// `values` holds one entry per original variable; `objective` is in the problem's own sense.
     Optimal {
-        #[cfg_attr(feature = "serde", serde(with = "crate::serde_rational::one"))]
         objective: Rational,
-        #[cfg_attr(feature = "serde", serde(with = "crate::serde_rational::vec"))]
         values: Vec<Rational>,
     },
     Infeasible,
@@ -258,8 +254,14 @@ fn check_dual_feasible(problem: &Problem) -> Result<(), Error> {
         }
     }
     let (wrong, needs) = match problem.sense {
-        Sense::Maximize => (Signed::is_positive as fn(&Rational) -> bool, "non-positive"),
-        Sense::Minimize => (Signed::is_negative as fn(&Rational) -> bool, "non-negative"),
+        Sense::Maximize => (
+            Rational::is_positive as fn(&Rational) -> bool,
+            "non-positive",
+        ),
+        Sense::Minimize => (
+            Rational::is_negative as fn(&Rational) -> bool,
+            "non-negative",
+        ),
     };
     if let Some((j, c)) = problem.objective.iter().enumerate().find(|(_, c)| wrong(c)) {
         return Err(Error::NotDualFeasible(format!(

@@ -19,6 +19,8 @@ serde = { version = "1", features = ["derive"], optional = true }
 [features]
 ## Serialize and deserialize problems, solutions and traces (rationals as exact strings like "3/2").
 serde = ["dep:serde"]
+## Convert `Rational` to and from `num_rational::BigRational` (ties you to its version).
+num-interop = []
 
 [dev-dependencies]
 serde_json = "1"

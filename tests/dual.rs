@@ -1,7 +1,6 @@
 //! The dual simplex method and post-optimality re-optimization. (Random cross-checks against
 //! brute force live in `oracle.rs`, exact textbook tableaus in `textbook_tableaus.rs`.)
 
-use num_traits::Signed;
 use simplex_trace::{
     Error, Method, Options, Phase, PivotRule, Problem, Relation, Status, Step, Termination, ratio,
     reoptimize, solve,

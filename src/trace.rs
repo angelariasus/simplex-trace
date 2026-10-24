@@ -1,7 +1,5 @@
 use std::fmt;
 
-use num_traits::Signed;
-
 use crate::num::{Coef, Rational};
 use crate::problem::Sense;
 
@@ -55,10 +53,8 @@ pub struct Snapshot {
     /// For each constraint row, the index of its basic column.
     pub basis: Vec<usize>,
     /// Constraint rows, without the right-hand side.
-    #[cfg_attr(feature = "serde", serde(with = "crate::serde_rational::vec_vec"))]
     pub rows: Vec<Vec<Rational>>,
     /// Right-hand side of each constraint row.
-    #[cfg_attr(feature = "serde", serde(with = "crate::serde_rational::vec"))]
     pub rhs: Vec<Rational>,
     /// Objective row, `z_j - c_j` per column (may contain the symbolic `M`).
     pub z: Vec<Coef>,
@@ -80,7 +76,7 @@ impl Snapshot {
     /// iteration; the dual simplex works towards it, so its intermediate tableaus are
     /// optimal but not feasible.
     pub fn is_feasible(&self) -> bool {
-        !self.rhs.iter().any(Signed::is_negative)
+        !self.rhs.iter().any(Rational::is_negative)
     }
 }
 
@@ -91,7 +87,6 @@ impl Snapshot {
 pub struct RatioTest {
     pub row: usize,
     /// `rhs / pivot-column entry`, or `None` when the entry is `<= 0` (row not eligible).
-    #[cfg_attr(feature = "serde", serde(with = "crate::serde_rational::option"))]
     pub ratio: Option<Rational>,
 }
 
@@ -102,7 +97,6 @@ pub struct RatioTest {
 pub struct DualRatioTest {
     pub column: usize,
     /// `|z_j - c_j| / |a_rj|`, or `None` when the entry `a_rj` is `>= 0` (column not eligible).
-    #[cfg_attr(feature = "serde", serde(with = "crate::serde_rational::option"))]
     pub ratio: Option<Rational>,
 }
 
@@ -112,7 +106,6 @@ pub struct DualRatioTest {
 #[non_exhaustive]
 pub struct NamedValue {
     pub name: String,
-    #[cfg_attr(feature = "serde", serde(with = "crate::serde_rational::one"))]
     pub value: Rational,
 }
 
@@ -159,14 +152,12 @@ pub enum Step {
         leaving_row: usize,
         leaving: usize,
         leaving_name: String,
-        #[cfg_attr(feature = "serde", serde(with = "crate::serde_rational::one"))]
         pivot_value: Rational,
         ratios: Vec<RatioTest>,
     },
     /// Phase 1 of the two-phase method finished.
     #[non_exhaustive]
     PhaseOneFinished {
-        #[cfg_attr(feature = "serde", serde(with = "crate::serde_rational::one"))]
         artificial_sum: Rational,
         feasible: bool,
     },
@@ -200,7 +191,6 @@ pub enum Step {
         leaving_name: String,
         entering: usize,
         entering_name: String,
-        #[cfg_attr(feature = "serde", serde(with = "crate::serde_rational::one"))]
         pivot_value: Rational,
         ratios: Vec<DualRatioTest>,
     },

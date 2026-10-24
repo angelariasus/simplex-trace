@@ -2,12 +2,7 @@ use std::cmp::Ordering;
 use std::fmt;
 use std::ops::Neg;
 
-use num_bigint::BigInt;
-use num_rational::BigRational;
-use num_traits::{Signed, Zero};
-
-/// Arbitrary-precision exact rational number used for every value in the crate.
-pub type Rational = BigRational;
+pub use crate::rational::Rational;
 
 /// Conversion into a [`Rational`], so the builder API accepts plain integers and fractions.
 pub trait IntoRational {
@@ -22,13 +17,13 @@ impl IntoRational for Rational {
 
 impl IntoRational for i32 {
     fn into_rational(self) -> Rational {
-        Rational::from_integer(BigInt::from(self))
+        Rational::from(self)
     }
 }
 
 impl IntoRational for i64 {
     fn into_rational(self) -> Rational {
-        Rational::from_integer(BigInt::from(self))
+        Rational::from(self)
     }
 }
 
@@ -41,7 +36,7 @@ impl IntoRational for (i64, i64) {
 
 /// Builds the fraction `n / d`. Panics if `d == 0`.
 pub fn ratio(n: i64, d: i64) -> Rational {
-    Rational::new(BigInt::from(n), BigInt::from(d))
+    Rational::new(n, d)
 }
 
 /// A number of the form `m·M + c`, where `M` is the symbolic "big M" penalty.
@@ -54,10 +49,8 @@ pub fn ratio(n: i64, d: i64) -> Rational {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Coef {
     /// Coefficient of `M`.
-    #[cfg_attr(feature = "serde", serde(with = "crate::serde_rational::one"))]
     pub m: Rational,
     /// Constant part.
-    #[cfg_attr(feature = "serde", serde(with = "crate::serde_rational::one"))]
     pub c: Rational,
 }
 
@@ -135,7 +128,7 @@ impl fmt::Display for Coef {
         if self.m.is_zero() {
             return write!(f, "{}", self.c);
         }
-        let one = Rational::from_integer(BigInt::from(1));
+        let one = Rational::one();
         let m = if self.m == one {
             "M".to_string()
         } else if self.m == -one {

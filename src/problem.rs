@@ -27,10 +27,8 @@ pub enum Relation {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Constraint {
-    #[cfg_attr(feature = "serde", serde(with = "crate::serde_rational::vec"))]
     pub coeffs: Vec<Rational>,
     pub relation: Relation,
-    #[cfg_attr(feature = "serde", serde(with = "crate::serde_rational::one"))]
     pub rhs: Rational,
 }
 
@@ -65,7 +63,6 @@ pub struct Constraint {
 #[non_exhaustive]
 pub struct Problem {
     pub sense: Sense,
-    #[cfg_attr(feature = "serde", serde(with = "crate::serde_rational::vec"))]
     pub objective: Vec<Rational>,
     pub constraints: Vec<Constraint>,
     /// Names of the variables. Empty means the defaults `x1`, `x2`, ...

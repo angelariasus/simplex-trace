@@ -14,7 +14,6 @@
 //! feasible, and every optimal solution is re-optimized after appending random constraints;
 //! both are compared with brute force and checked step by step.
 
-use num_traits::{Signed, Zero};
 use simplex_trace::{
     Error, Interval, Method, Options, Phase, PivotRule, Problem, Rational, Relation, Sense,
     Sensitivity, Snapshot, Solution, Status, Step, Termination, ratio, reoptimize, solve,

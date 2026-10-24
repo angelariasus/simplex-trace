@@ -38,15 +38,15 @@
 mod error;
 mod num;
 mod problem;
+mod rational;
 mod sensitivity;
-#[cfg(feature = "serde")]
-mod serde_rational;
 mod solver;
 mod trace;
 
 pub use error::Error;
-pub use num::{Coef, IntoRational, Rational, ratio};
+pub use num::{Coef, IntoRational, ratio};
 pub use problem::{Constraint, Problem, Relation, Sense};
+pub use rational::{ParseRationalError, Rational};
 pub use sensitivity::{ConstraintSensitivity, Interval, Sensitivity, Source, VariableSensitivity};
 pub use solver::{Method, Options, PivotRule, Solution, Status, reoptimize, solve};
 pub use trace::{DualRatioTest, NamedValue, Phase, RatioTest, Snapshot, Step, Termination, Trace};

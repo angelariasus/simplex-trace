@@ -1,7 +1,5 @@
 use std::fmt;
 
-use num_traits::{One, Signed, Zero};
-
 use crate::num::Rational;
 use crate::problem::{Problem, Relation, Sense};
 use crate::trace::write_table;
@@ -69,11 +67,9 @@ pub struct ConstraintSensitivity {
     /// is positive when raising `b_i` increases `z`, also when minimizing. LINDO's "dual
     /// price" is the improvement instead: the same value when maximizing, negated when
     /// minimizing.
-    #[cfg_attr(feature = "serde", serde(with = "crate::serde_rational::one"))]
     pub shadow_price: Rational,
     /// Unused amount at the optimum: `b_i - a_i x` for `<=`, `a_i x - b_i` for `>=`, and 0
     /// for `=`.
-    #[cfg_attr(feature = "serde", serde(with = "crate::serde_rational::one"))]
     pub slack: Rational,
     /// The constraint holds with equality at the optimum (`slack == 0`).
     pub binding: bool,
@@ -96,13 +92,11 @@ pub struct ConstraintSensitivity {
 #[non_exhaustive]
 pub struct VariableSensitivity {
     pub name: String,
-    #[cfg_attr(feature = "serde", serde(with = "crate::serde_rational::one"))]
     pub value: Rational,
     /// The variable is in the final basis.
     pub basic: bool,
     /// `z_j - c_j` in the final tableau (0 for basic variables). For a nonbasic variable it
     /// is how much its cost must improve before it is worth producing.
-    #[cfg_attr(feature = "serde", serde(with = "crate::serde_rational::one"))]
     pub reduced_cost: Rational,
     /// Values of the cost `c_j` (all else equal) for which the final basis, and so the
     /// current solution, stays optimal.
@@ -117,10 +111,8 @@ pub struct VariableSensitivity {
 #[non_exhaustive]
 pub struct Interval {
     /// Lower end, `None` for `-inf`.
-    #[cfg_attr(feature = "serde", serde(with = "crate::serde_rational::option"))]
     pub lower: Option<Rational>,
     /// Upper end, `None` for `+inf`.
-    #[cfg_attr(feature = "serde", serde(with = "crate::serde_rational::option"))]
     pub upper: Option<Rational>,
 }
 
@@ -391,7 +383,7 @@ pub(crate) fn analyze(
             }
             let rhs_range = if pinned[k] {
                 point()
-            } else if flip.is_one() {
+            } else if flip.is_positive() {
                 Interval::around(&c.rhs, lower, upper)
             } else {
                 Interval::around(&c.rhs, upper.map(|v| -v), lower.map(|v| -v))
@@ -478,7 +470,7 @@ pub(crate) fn analyze(
         from_final_tableau: matches!(cells, Cells::FinalTableau { .. }),
         constraints,
         variables,
-        degenerate: xb.iter().any(Zero::is_zero),
+        degenerate: xb.iter().any(Rational::is_zero),
         alternative_optima: nonbasic.iter().any(|&l| d[l].is_zero()),
     })
 }

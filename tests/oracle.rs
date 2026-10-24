@@ -162,6 +162,12 @@ fn matches_brute_force_on_random_problems() {
                             feasible(&problem, values),
                             "case {case}: infeasible point {values:?}"
                         );
+                        // The final tableau speaks the problem's own sense and value.
+                        let last = solution.trace.tableaus().last().unwrap();
+                        assert_eq!(last.sense, problem.sense, "case {case}");
+                        assert!(last.is_optimal(), "case {case}: final tableau not optimal");
+                        assert!(last.z_rhs.m.is_zero(), "case {case}: M left in objective");
+                        assert_eq!(&last.z_rhs.c, best, "case {case}: tableau objective");
                     }
                     (Status::Infeasible, None) => {}
                     (got, want) => panic!(

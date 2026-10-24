@@ -212,8 +212,8 @@ struct Stats {
     degenerate_pivots: usize,
     artificial_swaps: usize,
     redundant_rows: usize,
-    big_m_inconclusive_infeasible: usize,
-    big_m_inconclusive_unbounded: usize,
+    big_m_infeasible_at_optimum: usize,
+    big_m_infeasible_at_ray: usize,
 }
 
 /// Checks every step of the trace against the textbook rules.
@@ -271,7 +271,17 @@ fn check_trace(
                     "{ctx}: entering column does not improve"
                 );
                 match rule {
-                    PivotRule::Bland => assert_eq!(*entering, candidates[0], "{ctx}: Bland"),
+                    // Lowest index improving the M (penalty) part first, then lowest improving.
+                    PivotRule::Bland => {
+                        let improves_penalty = |j: &usize| match t.sense {
+                            Sense::Maximize => t.z[*j].m.is_negative(),
+                            Sense::Minimize => t.z[*j].m.is_positive(),
+                        };
+                        let want = (0..t.z.len())
+                            .find(improves_penalty)
+                            .unwrap_or(candidates[0]);
+                        assert_eq!(*entering, want, "{ctx}: Bland");
+                    }
                     PivotRule::Dantzig => {
                         let values = candidates.iter().map(|&j| &t.z[j]);
                         let best = match t.sense {
@@ -305,6 +315,35 @@ fn check_trace(
             }
             Step::ArtificialPivotedOut { .. } => stats.artificial_swaps += 1,
             Step::RedundantRowRemoved { .. } => stats.redundant_rows += 1,
+            Step::ArtificialRemainsPositive {
+                artificials,
+                unbounded_direction,
+            } => {
+                let t = current.expect("diagnosis before any tableau");
+                assert_eq!(solution.status, Status::Infeasible, "{ctx}");
+                assert!(!artificials.is_empty(), "{ctx}");
+                for (name, value) in artificials {
+                    assert!(value.is_positive(), "{ctx}: {name} = {value}");
+                    let row = t
+                        .basis
+                        .iter()
+                        .position(|&b| t.columns[b] == *name)
+                        .unwrap_or_else(|| panic!("{ctx}: {name} is not basic"));
+                    assert_eq!(&t.rhs[row], value, "{ctx}: value of {name}");
+                }
+                // The claim behind the diagnosis: no column can improve the penalty.
+                let penalty_optimal = t.z.iter().all(|c| match t.sense {
+                    Sense::Maximize => !c.m.is_negative(),
+                    Sense::Minimize => !c.m.is_positive(),
+                });
+                assert!(penalty_optimal, "{ctx}: M row could still improve");
+                assert_eq!(*unbounded_direction, !t.is_optimal(), "{ctx}");
+                if *unbounded_direction {
+                    stats.big_m_infeasible_at_ray += 1;
+                } else {
+                    stats.big_m_infeasible_at_optimum += 1;
+                }
+            }
             Step::PhaseOneFinished { .. } | Step::Finished(_) => {}
         }
     }
@@ -352,21 +391,21 @@ fn matches_brute_force_on_random_problems() {
                         assert!(needs_artificials(&problem), "{ctx}");
                         continue;
                     }
-                    // Big-M may legitimately be unable to decide; it can only happen when the
-                    // problem has no finite optimum.
-                    Err(Error::Inconclusive) if method == Method::BigM => {
-                        match expected {
-                            Expected::Optimal(_) => panic!("{ctx}: Big-M inconclusive"),
-                            Expected::Infeasible => stats.big_m_inconclusive_infeasible += 1,
-                            Expected::Unbounded => stats.big_m_inconclusive_unbounded += 1,
-                        }
-                        continue;
-                    }
                     Err(e) => panic!("{ctx}: {e}"),
                 };
                 if method == Method::Simplex {
                     assert!(!needs_artificials(&problem), "{ctx}");
                     stats.simplex_runs += 1;
+                }
+                if method == Method::BigM && solution.status == Status::Infeasible {
+                    assert!(
+                        solution
+                            .trace
+                            .steps
+                            .iter()
+                            .any(|s| matches!(s, Step::ArtificialRemainsPositive { .. })),
+                        "{ctx}: Big-M infeasibility without a diagnosis step"
+                    );
                 }
 
                 check_trace(&problem, rule, &solution, &mut stats, &ctx);
@@ -409,4 +448,6 @@ fn matches_brute_force_on_random_problems() {
     assert!(stats.degenerate_pivots >= 100, "{stats:#?}");
     assert!(stats.artificial_swaps >= 5, "{stats:#?}");
     assert!(stats.redundant_rows >= 5, "{stats:#?}");
+    assert!(stats.big_m_infeasible_at_optimum >= 20, "{stats:#?}");
+    assert!(stats.big_m_infeasible_at_ray >= 5, "{stats:#?}");
 }

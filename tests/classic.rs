@@ -192,3 +192,51 @@ fn malformed_problem_is_an_error() {
         Err(Error::InvalidProblem(_))
     ));
 }
+
+#[test]
+fn big_m_diagnoses_infeasibility_at_an_unbounded_direction() {
+    // -x1 >= 1 has no non-negative solution, but x3 is an unbounded direction:
+    // Big-M meets the ray while a1 = 1, after the M row has nothing left to improve.
+    let problem = Problem::maximize([0, 1, 0])
+        .subject_to([-1, 0, 0], Relation::Ge, 1)
+        .subject_to([0, 1, -1], Relation::Le, 1);
+    for rule in [PivotRule::Dantzig, PivotRule::Bland] {
+        let options = Options {
+            pivot_rule: rule,
+            ..Options::default()
+        };
+        let solution = solve(&problem, Method::BigM, &options).unwrap();
+        assert_eq!(solution.status, Status::Infeasible, "{rule:?}");
+        assert!(
+            solution
+                .trace
+                .steps
+                .contains(&Step::ArtificialRemainsPositive {
+                    artificials: vec![("a1".to_string(), ratio(1, 1))],
+                    unbounded_direction: true,
+                })
+        );
+        assert!(solution.trace.to_string().contains(
+            "an unbounded direction was found, but the M row cannot improve and a1 = 1 is still positive"
+        ));
+    }
+    let two_phase = solve(&problem, Method::TwoPhase, &Options::default()).unwrap();
+    assert_eq!(two_phase.status, Status::Infeasible);
+}
+
+#[test]
+fn big_m_diagnoses_infeasibility_at_an_optimal_tableau() {
+    let problem = Problem::maximize([1, 1])
+        .subject_to([1, 1], Relation::Le, 1)
+        .subject_to([1, 1], Relation::Ge, 2);
+    let solution = solve(&problem, Method::BigM, &Options::default()).unwrap();
+    assert!(
+        solution
+            .trace
+            .steps
+            .contains(&Step::ArtificialRemainsPositive {
+                artificials: vec![("a2".to_string(), ratio(1, 1))],
+                unbounded_direction: false,
+            })
+    );
+}

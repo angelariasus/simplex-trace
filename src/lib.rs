@@ -49,3 +49,8 @@ pub use problem::{Constraint, Problem, Relation, Sense};
 pub use sensitivity::{ConstraintSensitivity, Interval, Sensitivity, Source, VariableSensitivity};
 pub use solver::{Method, Options, PivotRule, Solution, Status, solve};
 pub use trace::{NamedValue, Phase, RatioTest, Snapshot, Step, Termination, Trace};
+
+// Compile the Rust examples of the README as doctests, so it cannot drift from the API.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;

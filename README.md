@@ -4,8 +4,9 @@
 
 **An exact-arithmetic simplex solver that shows its work.**
 
-Solve linear programs with the primal simplex, Big-M and two-phase methods, and get back
-every tableau, ratio test and pivot as data, plus a full sensitivity analysis.
+Solve linear programs with the primal simplex, Big-M, two-phase and dual simplex methods,
+and get back every tableau, ratio test and pivot as data, plus a full sensitivity analysis
+and post-optimality re-optimization.
 
 [![Crates.io](https://img.shields.io/crates/v/simplex-trace.svg?logo=rust)](https://crates.io/crates/simplex-trace)
 [![Docs.rs](https://img.shields.io/docsrs/simplex-trace?logo=docsdotrs)](https://docs.rs/simplex-trace)
@@ -37,6 +38,7 @@ every tableau, ratio test and pivot as data, plus a full sensitivity analysis.
   - [Reading the result](#reading-the-result)
   - [Walking the trace](#walking-the-trace)
   - [Sensitivity analysis](#sensitivity-analysis)
+  - [Adding constraints after the optimum](#adding-constraints-after-the-optimum)
   - [JSON](#json)
 - [Conventions](#conventions)
 - [How it is tested](#how-it-is-tested)
@@ -60,6 +62,7 @@ reached**, exactly as the method is taught in an operations research course: no
 | Output              | The optimum                  | The optimum **and** every tableau and pivot        |
 | Big-M               | A large numeric `M`, if any  | A symbolic `M` (`7M - 4`), never a guessed value   |
 | Sensitivity         | Floating-point ranges        | Exact ranges, each price linked to a tableau cell  |
+| Post-optimality     | Warm start, hidden           | Dual simplex pivots you can follow, from the final tableau |
 | Built for           | Large real-world models      | Teaching, learning tools, verification             |
 
 Typical uses: step-by-step solvers for students, interactive learning apps, checking
@@ -68,7 +71,8 @@ problems.
 
 ## Features
 
-- **Three methods:** primal simplex, Big-M (with `M` kept symbolic) and two-phase.
+- **Four methods:** primal simplex, Big-M (with `M` kept symbolic), two-phase and dual
+  simplex.
 - **Exact arithmetic:** arbitrary-precision rationals, so every tableau matches a hand
   calculation digit for digit.
 - **Full trace:** every tableau snapshot, the entering and leaving variables, the
@@ -76,6 +80,8 @@ problems.
   redundant rows removed.
 - **Sensitivity analysis** of every optimal solution: shadow prices, slacks, reduced costs,
   and the right-hand-side and cost ranges that keep the basis optimal.
+- **Post-optimality:** add constraints to a solved problem and repair the solution with dual
+  simplex pivots from the final tableau, instead of solving again.
 - **Always conclusive:** every method reports optimal, infeasible or unbounded, and the trace
   explains why, including a diagnosis when Big-M proves infeasibility.
 - **Pivot rules:** Dantzig (the textbook rule) or Bland (anti-cycling).
@@ -88,10 +94,10 @@ problems.
 
 ```toml
 [dependencies]
-simplex-trace = "0.1"
+simplex-trace = "0.2"
 
 # Or, to (de)serialize problems, solutions and traces as JSON:
-# simplex-trace = { version = "0.1", features = ["serde"] }
+# simplex-trace = { version = "0.2", features = ["serde"] }
 ```
 
 ## Quick start
@@ -184,6 +190,7 @@ for you.
 | `Method::Simplex`  | Problems whose constraints are all `<=` after normalization, so the slacks give the starting basis. Anything else returns `Error::ArtificialVariablesRequired`. |
 | `Method::BigM`     | Any problem. Artificial variables are penalized with a symbolic `M`.        |
 | `Method::TwoPhase` | Any problem. Phase 1 finds a feasible basis, phase 2 optimizes.             |
+| `Method::DualSimplex` | Problems whose slack basis is dual feasible: `<=` / `>=` constraints only, with non-negative costs when minimizing or non-positive when maximizing (the textbook case: minimize with `>=`). Starts infeasible and pivots until feasible; no `M`, no artificial variables. Anything else returns `Error::NotDualFeasible`. |
 
 ```rust
 use simplex_trace::{solve, Error, Method, Options, PivotRule, Problem, Relation};
@@ -256,6 +263,8 @@ assert_eq!(solution.trace.pivot_count(), 3);
 ```
 
 With Big-M, objective values are printed with the symbolic `M`, such as `9M` or `7M - 4`.
+The dual simplex records `Step::DualPivot` (its ratio test runs over the columns of the
+leaving row) and, when a row proves infeasibility, `Step::InfeasibleRow`.
 
 ### Sensitivity analysis
 
@@ -312,6 +321,69 @@ Edge cases are reported, not hidden:
   an equivalent optimal basis of the real problem (the same solution, reached by degenerate
   pivots), and `from_final_tableau` is `false`.
 
+### Adding constraints after the optimum
+
+`reoptimize` takes a solved problem plus new `<=` / `>=` constraints and continues from the
+previous final tableau: each new row is expressed in the current basis with its own slack
+(`Step::ConstraintAdded`), and dual simplex pivots restore feasibility. Nothing is solved
+again, and the trace shows exactly what changed.
+
+```rust
+use simplex_trace::{reoptimize, solve, Method, Options, Problem, Relation, Status, ratio};
+
+// TOYCO (Taha): max 3x1 + 2x2 + 5x3, optimal at z = 1350 with x = (0, 100, 230).
+let toyco = Problem::maximize([3, 2, 5])
+    .subject_to([1, 2, 1], Relation::Le, 430)
+    .subject_to([3, 0, 2], Relation::Le, 460)
+    .subject_to([1, 4, 0], Relation::Le, 420);
+let first = solve(&toyco, Method::Simplex, &Options::default()).unwrap();
+
+// The optimum violates 3x1 + 3x2 + x3 <= 500 (530 > 500): one dual pivot repairs it.
+let extended = toyco.subject_to([3, 3, 1], Relation::Le, 500);
+let second = reoptimize(&first, &extended, &Options::default()).unwrap();
+
+assert_eq!(second.trace.pivot_count(), 1);
+assert_eq!(
+    second.status,
+    Status::Optimal { objective: ratio(1330, 1), values: vec![ratio(0, 1), ratio(90, 1), ratio(230, 1)] }
+);
+print!("{}", second.trace);
+```
+
+```text
+-> constraint 4 added as row 4 (violated by the current solution)
+
+== dual simplex, iteration 0 ==
+basis |   x1 | x2 | x3 |   s1 |   s2 | s3 | s4 |  rhs
+------+------+----+----+------+------+----+----+-----
+x2    | -1/4 |  1 |  0 |  1/2 | -1/4 |  0 |  0 |  100
+x3    |  3/2 |  0 |  1 |    0 |  1/2 |  0 |  0 |  230
+s3    |    2 |  0 |  0 |   -2 |    1 |  1 |  0 |   20
+s4    |  9/4 |  0 |  0 | -3/2 |  1/4 |  0 |  1 |  -30
+z     |    4 |  0 |  0 |    1 |    2 |  0 |  0 | 1350
+
+-> s4 leaves (row 4), s1 enters (pivot -3/2); ratios [s1: 2/3]
+
+== dual simplex, iteration 1 ==
+basis |   x1 | x2 | x3 | s1 |   s2 | s3 |   s4 |  rhs
+------+------+----+----+----+------+----+------+-----
+x2    |  1/2 |  1 |  0 |  0 | -1/6 |  0 |  1/3 |   90
+x3    |  3/2 |  0 |  1 |  0 |  1/2 |  0 |    0 |  230
+s3    |   -1 |  0 |  0 |  0 |  2/3 |  1 | -4/3 |   60
+s1    | -3/2 |  0 |  0 |  1 | -1/6 |  0 | -2/3 |   20
+z     | 11/2 |  0 |  0 |  0 | 13/6 |  0 |  2/3 | 1330
+
+== Optimal ==
+```
+
+The result is an ordinary solution of the extended problem, with its own sensitivity report,
+so it can be extended again. If the new constraints already hold at the optimum nothing
+moves; if they cannot hold inside the feasible region, a row proves it and the status is
+`Infeasible`. A solution only needs its final basis to be extended, which it carries, so this
+also works on a solution loaded from JSON. The previous solution must be optimal, and the
+extended problem must be the previous one with constraints appended (`Error::InvalidProblem`
+otherwise). Run `cargo run --example dual` to see this and the dual simplex on Taha's example.
+
 ### JSON
 
 With the `serde` feature, problems, solutions, traces and sensitivity reports are
@@ -335,13 +407,14 @@ let solution = solve(&problem, Method::BigM, &Options::default())?;
 println!("{}", serde_json::to_string_pretty(&solution)?);
 ```
 
-The status sits at the top level, next to the sensitivity report and the trace:
+The status sits at the top level, next to the problem, the sensitivity report and the trace:
 
 ```json
 {
   "status": "optimal",
   "objective": "17/5",
   "values": ["2/5", "9/5"],
+  "problem": { "sense": "minimize", "objective": ["4", "1"], "constraints": ["..."] },
   "sensitivity": { "basic_variables": ["..."], "constraints": ["..."], "variables": ["..."] },
   "trace": { "sense": "minimize", "steps": ["..."] }
 }
@@ -361,8 +434,9 @@ Every step has a `"type"`. Values that may contain the symbolic `M` are objects 
 ```
 
 Step types are `tableau`, `pivot`, `phase_one_finished`, `artificial_pivoted_out`,
-`redundant_row_removed`, `artificial_remains_positive` and `finished`. New types may appear
-in minor releases, so a client should skip types it does not know. Infinite range ends are
+`redundant_row_removed`, `artificial_remains_positive`, `dual_pivot`, `infeasible_row`,
+`constraint_added` and `finished`. New types may appear in minor releases, so a client should
+skip types it does not know. Infinite range ends are
 `null`. Run `cargo run --example json --features serde` to see a complete solution.
 
 ## Conventions
@@ -382,6 +456,12 @@ line by line:
   infeasible, and the trace records it.
 - **Two-phase:** phase 1 minimizes `r = a1 + a2 + ...` in a row labelled `r`; phase 2 drops the
   artificial columns and prices out the real objective.
+- **Dual simplex:** every constraint is written as `<=` (a `>=` is multiplied by `-1`), so the
+  slacks form the starting basis and right-hand sides may be negative. The row with the most
+  negative right-hand side leaves (Bland: the negative row with the lowest basic index); among
+  the columns with a negative entry in that row, the one with the smallest `|z_j - c_j| / |a_rj|`
+  enters, which keeps the objective row optimal. A negative row with no negative entry proves
+  the problem infeasible. The method never ends unbounded.
 - **Columns:** original variables, then slack and surplus (`s1`, `s2`, ...), then artificial
   variables (`a1`, `a2`, ...), numbered by constraint.
 
@@ -400,6 +480,12 @@ an independent source:
   dual feasibility and agreement with the final tableau. Every range is probed by brute force:
   at its ends the objective must follow the claimed slope, and just beyond them the basis
   must stop being optimal.
+- **Dual simplex and re-optimization oracle:** the dual simplex runs on every problem it
+  applies to plus 150 problems built to be dual feasible, and every optimal solution of every
+  method is re-optimized after appending random constraints (satisfied, violated or
+  incompatible). Results are compared with brute force; each dual pivot is checked against the
+  leaving-row and ratio-test rules, every dual tableau must keep an optimal objective row, and
+  the re-optimization must start from the previous final tableau.
 - **Classic cases:** infeasible, unbounded, redundant equalities, negative right-hand sides
   and Beale's cycling example.
 - **JSON contract:** exact round trips, and the shape of every object is pinned by tests.
@@ -428,8 +514,10 @@ It will only be raised in a minor release, with a note in the [changelog](CHANGE
 - [x] Primal simplex, Big-M and two-phase methods with a full trace
 - [x] Sensitivity analysis
 - [x] JSON support
-- [ ] Dual simplex, and with it adding a constraint or a variable after the optimum
+- [x] Dual simplex, and adding constraints after the optimum
+- [ ] Adding variables after the optimum (pricing the new column, then primal pivots)
 - [ ] Free (unrestricted-sign) variables
+- [ ] The artificial-constraint technique, for starts that are neither primal nor dual feasible
 
 ## Contributing
 
@@ -447,8 +535,8 @@ the most convincing evidence.
 
 ## References
 
-- Hamdy A. Taha, *Operations Research: An Introduction*. Tableau conventions, and the Big-M
-  and two-phase examples.
+- Hamdy A. Taha, *Operations Research: An Introduction*. Tableau conventions, the Big-M,
+  two-phase and dual simplex examples, and the TOYCO post-optimality example.
 - Frederick S. Hillier and Gerald J. Lieberman, *Introduction to Operations Research*. The
   Wyndor Glass Co. example and the shadow-price convention.
 - E. M. L. Beale, "Cycling in the dual simplex algorithm", *Naval Research Logistics

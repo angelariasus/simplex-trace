@@ -116,7 +116,9 @@ impl Problem {
         self
     }
 
-    /// Overrides the default variable names (`x1`, `x2`, ...).
+    /// Overrides the default variable names (`x1`, `x2`, ...). Names must be unique and may
+    /// not look like a slack or artificial column (`s1`, `a2`, ...); [`solve`](crate::solve)
+    /// rejects such problems.
     pub fn with_names<S: Into<String>>(mut self, names: impl IntoIterator<Item = S>) -> Self {
         self.var_names = names.into_iter().map(Into::into).collect();
         self
@@ -146,6 +148,29 @@ impl Problem {
                 "{} variable names for {n} variables",
                 self.var_names.len()
             )));
+        }
+        for (j, name) in self.var_names.iter().enumerate() {
+            if name.is_empty() {
+                return Err(Error::InvalidProblem(format!(
+                    "variable {} has an empty name",
+                    j + 1
+                )));
+            }
+            if self.var_names[..j].contains(name) {
+                return Err(Error::InvalidProblem(format!(
+                    "duplicate variable name {name:?}"
+                )));
+            }
+            // `s1`, `a2`, ... are the slack/surplus and artificial columns of the tableau.
+            let mut chars = name.chars();
+            let reserved = matches!(chars.next(), Some('s' | 'a'))
+                && chars.clone().next().is_some()
+                && chars.all(|c| c.is_ascii_digit());
+            if reserved {
+                return Err(Error::InvalidProblem(format!(
+                    "variable name {name:?} is reserved for slack and artificial columns"
+                )));
+            }
         }
         for (i, c) in self.constraints.iter().enumerate() {
             if c.coeffs.len() != n {

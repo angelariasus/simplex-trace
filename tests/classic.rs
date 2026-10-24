@@ -238,3 +238,21 @@ fn diagnosis(solution: &Solution) -> Option<(Vec<(String, Rational)>, bool)> {
         _ => None,
     })
 }
+
+#[test]
+fn duplicate_empty_or_reserved_names_are_rejected() {
+    let solve_named = |names: [&str; 2]| {
+        let problem = wyndor().with_names(names);
+        solve(&problem, Method::Simplex, &Options::default())
+    };
+    assert!(solve_named(["doors", "windows"]).is_ok());
+    for names in [["x", "x"], ["", "y"], ["s1", "y"], ["x", "a2"]] {
+        assert!(
+            matches!(solve_named(names), Err(Error::InvalidProblem(_))),
+            "{names:?} should be rejected"
+        );
+    }
+    // Only the exact slack/artificial pattern is reserved.
+    assert!(solve_named(["s", "a"]).is_ok());
+    assert!(solve_named(["s1x", "sales"]).is_ok());
+}

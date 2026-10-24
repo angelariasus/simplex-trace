@@ -29,3 +29,10 @@ all-features = true
 [[example]]
 name = "json"
 required-features = ["serde"]
+
+# Exact big-integer arithmetic is very slow unoptimized; the oracle test runs ~8x faster.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

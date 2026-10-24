@@ -5,7 +5,8 @@
 //! tool or UI can replay the method exactly as it is done by hand.
 //!
 //! Supported methods: primal simplex, Big-M (with a symbolic `M`) and two-phase.
-//! All variables are non-negative.
+//! All variables are non-negative. Every optimal solution includes a [`Sensitivity`] analysis:
+//! shadow prices, reduced costs and ranges.
 //!
 //! With the **`serde`** feature, [`Problem`], [`Solution`], [`Trace`] and every [`Step`] can be
 //! (de)serialized, e.g. to JSON for a web front end. Numbers are exact strings such as `"3/2"`.
@@ -34,6 +35,7 @@
 mod error;
 mod num;
 mod problem;
+mod sensitivity;
 #[cfg(feature = "serde")]
 mod serde_rational;
 mod solver;
@@ -42,5 +44,6 @@ mod trace;
 pub use error::Error;
 pub use num::{Coef, IntoRational, Rational, ratio};
 pub use problem::{Constraint, Problem, Relation, Sense};
+pub use sensitivity::{ConstraintSensitivity, Interval, Sensitivity, Source, VariableSensitivity};
 pub use solver::{Method, Options, PivotRule, Solution, Status, solve};
 pub use trace::{NamedValue, Phase, RatioTest, Snapshot, Step, Termination, Trace};

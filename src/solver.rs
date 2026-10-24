@@ -3,6 +3,7 @@ use num_traits::{One, Signed, Zero};
 use crate::error::Error;
 use crate::num::{Coef, Rational};
 use crate::problem::{Problem, Relation, Sense};
+use crate::sensitivity::{self, Cells, Sensitivity, StandardForm};
 use crate::trace::{NamedValue, Phase, RatioTest, Snapshot, Step, Termination, Trace};
 
 /// Which variant of the simplex method to run.
@@ -93,16 +94,24 @@ pub enum Status {
     Unbounded,
 }
 
-/// The status plus the full step-by-step trace that produced it.
+/// The status, the sensitivity analysis (when optimal) and the full step-by-step trace.
 ///
 /// With the `serde` feature the status fields sit at the top level:
-/// `{"status": "optimal", "objective": "17/5", "values": [...], "trace": {...}}`.
+/// `{"status": "optimal", "objective": "17/5", "values": [...], "sensitivity": {...}, "trace": {...}}`.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Solution {
     #[cfg_attr(feature = "serde", serde(flatten))]
     pub status: Status,
+    /// Shadow prices, reduced costs and ranges, computed for every optimal solution.
+    ///
+    /// `None` exactly when the status is not optimal.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub sensitivity: Option<Sensitivity>,
     pub trace: Trace,
 }
 
@@ -147,6 +156,10 @@ pub fn solve(problem: &Problem, method: Method, options: &Options) -> Result<Sol
         }
     };
 
+    let sensitivity = match status {
+        End::Optimal => t.sensitivity(problem),
+        _ => None,
+    };
     let (status, termination) = match status {
         End::Optimal => {
             let status = Status::Optimal {
@@ -159,7 +172,11 @@ pub fn solve(problem: &Problem, method: Method, options: &Options) -> Result<Sol
         End::Unbounded => (Status::Unbounded, Termination::Unbounded),
     };
     trace.push(Step::Finished { termination });
-    Ok(Solution { status, trace })
+    Ok(Solution {
+        status,
+        sensitivity,
+        trace,
+    })
 }
 
 enum End {
@@ -168,12 +185,17 @@ enum End {
     Unbounded,
 }
 
+#[derive(Clone)]
 struct Tableau {
     /// Sense of the objective currently in the `z` row (phase 1 is always `Minimize`).
     sense: Sense,
     objective_label: &'static str,
     names: Vec<String>,
     artificial: Vec<bool>,
+    /// For each artificial column, the constraint it was added to.
+    artificial_owner: Vec<Option<usize>>,
+    /// Redundant equalities whose row was removed (by constraint index).
+    removed: Vec<usize>,
     rows: Vec<Vec<Rational>>,
     rhs: Vec<Rational>,
     basis: Vec<usize>,
@@ -218,9 +240,11 @@ impl Tableau {
         }
         let first_artificial = names.len();
         let mut art_col = vec![None; normalized.len()];
+        let mut artificial_owner = vec![None; first_artificial];
         for (i, (_, relation, _)) in normalized.iter().enumerate() {
             if *relation != Relation::Le {
                 art_col[i] = Some(names.len());
+                artificial_owner.push(Some(i));
                 names.push(format!("a{}", i + 1));
             }
         }
@@ -255,6 +279,8 @@ impl Tableau {
             sense: problem.sense,
             objective_label: "z",
             artificial: (0..width).map(|j| j >= first_artificial).collect(),
+            artificial_owner,
+            removed: Vec::new(),
             names,
             rows,
             rhs,
@@ -534,6 +560,10 @@ impl Tableau {
                     i += 1;
                 }
                 None => {
+                    // The basic artificial's own constraint is the redundant one: its row
+                    // is the only one with a 1 under that artificial's column.
+                    self.removed
+                        .push(self.artificial_owner[self.basis[i]].expect("artificial column"));
                     self.rows.remove(i);
                     self.rhs.remove(i);
                     self.basis.remove(i);
@@ -551,6 +581,7 @@ impl Tableau {
         }
         self.names = keep.iter().map(|&j| self.names[j].clone()).collect();
         self.artificial = vec![false; keep.len()];
+        self.artificial_owner = vec![None; keep.len()];
         for row in self.rows.iter_mut() {
             *row = keep.iter().map(|&j| row[j].clone()).collect();
         }
@@ -559,6 +590,64 @@ impl Tableau {
         }
         self.z = vec![Coef::zero(); keep.len()];
         self.z_rhs = Coef::zero();
+    }
+
+    /// Sensitivity of the final (optimal) basis.
+    ///
+    /// With Big-M a basic artificial may remain at zero. If its row is zero in every real
+    /// column it is a redundant equality and is dropped, as the two-phase method does.
+    /// Otherwise the basis is not one of the real problem: on a copy, the artificials are
+    /// pivoted out and the real objective re-optimized. Those pivots are all degenerate (the
+    /// solution is already optimal, so no pivot can move it), so the analysis still describes
+    /// the reported solution.
+    fn sensitivity(&self, problem: &Problem) -> Option<Sensitivity> {
+        let mut removed = self.removed.clone();
+        let mut basis = Vec::with_capacity(self.basis.len());
+        for (i, &b) in self.basis.iter().enumerate() {
+            if !self.artificial[b] {
+                basis.push(b);
+                continue;
+            }
+            let redundant =
+                (0..self.names.len()).all(|j| self.artificial[j] || self.rows[i][j].is_zero());
+            if !redundant {
+                return self.rebased_sensitivity(problem);
+            }
+            removed.push(self.artificial_owner[b].expect("artificial column"));
+        }
+        let cells = Cells::FinalTableau {
+            artificial_columns: self.has_artificials(),
+        };
+        self.analyze(problem, &basis, &removed, cells)
+    }
+
+    fn rebased_sensitivity(&self, problem: &Problem) -> Option<Sensitivity> {
+        let mut t = self.clone();
+        let mut scratch = Trace::new(problem.sense);
+        t.drop_artificials(&mut scratch);
+        t.set_objective(problem.sense, "z", &problem.objective, &Coef::zero());
+        let options = Options::default().pivot_rule(PivotRule::Bland);
+        match t.optimize(Phase::Two, &options, &mut scratch) {
+            Ok(End::Optimal) => t.analyze(problem, &t.basis, &t.removed, Cells::None),
+            _ => None, // unreachable: the starting basis is feasible and optimal in value
+        }
+    }
+
+    fn analyze(
+        &self,
+        problem: &Problem,
+        basis: &[usize],
+        removed: &[usize],
+        cells: Cells,
+    ) -> Option<Sensitivity> {
+        let start = Tableau::standard_form(problem);
+        let form = StandardForm {
+            rows: &start.rows,
+            rhs: &start.rhs,
+            names: &start.names,
+            artificial: &start.artificial,
+        };
+        sensitivity::analyze(problem, form, basis, removed, cells)
     }
 
     fn values(&self, n: usize) -> Vec<Rational> {

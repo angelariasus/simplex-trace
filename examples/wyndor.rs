@@ -1,4 +1,4 @@
-//! Prints the full trace of a textbook problem.
+//! Prints the full trace of a textbook problem and its sensitivity analysis.
 //!
 //! Run with `cargo run --example wyndor`.
 
@@ -17,5 +17,11 @@ fn main() {
     if let Status::Optimal { objective, values } = solution.status {
         let values: Vec<String> = values.iter().map(ToString::to_string).collect();
         println!("z* = {objective}, x* = ({})", values.join(", "));
+    }
+    if let Some(sensitivity) = &solution.sensitivity {
+        print!(
+            "
+{sensitivity}"
+        );
     }
 }

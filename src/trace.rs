@@ -234,38 +234,43 @@ impl fmt::Display for Snapshot {
         z_line.extend(self.z.iter().map(|v| v.to_string()));
         z_line.push(self.z_rhs.to_string());
         table.push(z_line);
+        write_table(f, &table)
+    }
+}
 
-        let widths: Vec<usize> = (0..table[0].len())
-            .map(|c| {
-                table
-                    .iter()
-                    .map(|r| r[c].chars().count())
-                    .max()
-                    .unwrap_or(0)
+/// Writes rows of cells as an aligned table: the first column left-aligned, the rest
+/// right-aligned, with a rule under the header row.
+pub(crate) fn write_table(f: &mut fmt::Formatter<'_>, table: &[Vec<String>]) -> fmt::Result {
+    let widths: Vec<usize> = (0..table[0].len())
+        .map(|c| {
+            table
+                .iter()
+                .map(|r| r[c].chars().count())
+                .max()
+                .unwrap_or(0)
+        })
+        .collect();
+
+    for (r, line) in table.iter().enumerate() {
+        let cells: Vec<String> = line
+            .iter()
+            .zip(&widths)
+            .enumerate()
+            .map(|(c, (cell, w))| {
+                if c == 0 {
+                    format!("{cell:<w$}")
+                } else {
+                    format!("{cell:>w$}")
+                }
             })
             .collect();
-
-        for (r, line) in table.iter().enumerate() {
-            let cells: Vec<String> = line
-                .iter()
-                .zip(&widths)
-                .enumerate()
-                .map(|(c, (cell, w))| {
-                    if c == 0 {
-                        format!("{cell:<w$}")
-                    } else {
-                        format!("{cell:>w$}")
-                    }
-                })
-                .collect();
-            writeln!(f, "{}", cells.join(" | "))?;
-            if r == 0 {
-                let rule: Vec<String> = widths.iter().map(|w| "-".repeat(*w)).collect();
-                writeln!(f, "{}", rule.join("-+-"))?;
-            }
+        writeln!(f, "{}", cells.join(" | "))?;
+        if r == 0 {
+            let rule: Vec<String> = widths.iter().map(|w| "-".repeat(*w)).collect();
+            writeln!(f, "{}", rule.join("-+-"))?;
         }
-        Ok(())
     }
+    Ok(())
 }
 
 impl fmt::Display for Trace {

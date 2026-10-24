@@ -13,14 +13,19 @@
 //! The dual simplex runs on every problem it applies to, plus extra problems built to be dual
 //! feasible, and every optimal solution is re-optimized after appending random constraints;
 //! both are compared with brute force and checked step by step.
+//!
+//! Free and non-positive variables get their own problems; the brute force then works on the
+//! original variables (sign planes only where a sign is imposed, a box that bounds them in
+//! both directions), never on the solver's split columns.
 
 use simplex_trace::{
     Error, Interval, Method, Options, Phase, PivotRule, Problem, Rational, Relation, Sense,
-    Sensitivity, Snapshot, Solution, Status, Step, Termination, ratio, reoptimize, solve,
+    Sensitivity, Sign, Snapshot, Solution, Status, Step, Termination, ratio, reoptimize, solve,
 };
 
 const CASES: usize = 600;
 const DUAL_CASES: usize = 150;
+const SIGNED_CASES: usize = 200;
 const BIG_K: i64 = 1_000_000_000;
 
 /// Small deterministic xorshift generator, so failures are reproducible without extra deps.
@@ -134,16 +139,73 @@ fn random_extension(rng: &mut Rng, problem: &Problem) -> Problem {
     extended
 }
 
-/// Whether the dual simplex can start from the slack basis of `problem`.
+/// A general problem (or, one time in four, a dual feasible one) whose variables are free or
+/// non-positive with some probability, so every method meets split columns.
+fn random_signed(rng: &mut Rng) -> Problem {
+    let mut problem = if rng.chance(25) {
+        random_dual_feasible(rng)
+    } else {
+        random_general(rng)
+    };
+    let mut any = false;
+    for j in 0..problem.num_vars() {
+        match rng.range(0, 9) {
+            0..=2 => problem = problem.free(j),
+            3..=4 => problem = problem.non_positive(j),
+            _ => continue,
+        }
+        any = true;
+    }
+    if !any {
+        problem = problem.free(0);
+    }
+    problem
+}
+
+/// Whether the dual simplex can start from the slack basis of `problem`: every column cost
+/// has the right sign (a non-positive variable's column costs `-c_j`, a free variable has
+/// columns costing `c_j` and `-c_j`).
 fn is_dual_feasible(problem: &Problem) -> bool {
+    let right = |c: &Rational| match problem.sense {
+        Sense::Maximize => !c.is_positive(),
+        Sense::Minimize => !c.is_negative(),
+    };
     problem
         .constraints
         .iter()
         .all(|c| c.relation != Relation::Eq)
-        && problem.objective.iter().all(|c| match problem.sense {
-            Sense::Maximize => !c.is_positive(),
-            Sense::Minimize => !c.is_negative(),
+        && problem
+            .objective
+            .iter()
+            .enumerate()
+            .all(|(j, c)| match problem.sign(j) {
+                Sign::NonNegative => right(c),
+                Sign::NonPositive => right(&-c),
+                _ => c.is_zero(),
+            })
+}
+
+/// The tableau columns of each original variable, as (column index, column name, negated):
+/// `x` (non-negative), `x+` and `x-` (free), `x-` (non-positive), numbered left to right.
+fn columns_of(problem: &Problem) -> Vec<Vec<(usize, String, bool)>> {
+    let mut next = 0;
+    let mut column = |name: String, negated: bool| {
+        next += 1;
+        (next - 1, name, negated)
+    };
+    (0..problem.num_vars())
+        .map(|j| {
+            let name = problem.var_name(j);
+            match problem.sign(j) {
+                Sign::NonNegative => vec![column(name, false)],
+                Sign::NonPositive => vec![column(format!("{name}-"), true)],
+                _ => vec![
+                    column(format!("{name}+"), false),
+                    column(format!("{name}-"), true),
+                ],
+            }
         })
+        .collect()
 }
 
 /// Whether the standard form of `problem` has an artificial variable.
@@ -178,27 +240,30 @@ fn solve_square(mut a: Vec<Vec<Rational>>, mut b: Vec<Rational>) -> Option<Vec<R
 }
 
 fn feasible(problem: &Problem, x: &[Rational]) -> bool {
-    x.iter().all(|v| !v.is_negative())
-        && problem.constraints.iter().all(|c| {
-            let lhs: Rational = c.coeffs.iter().zip(x).map(|(a, v)| a * v).sum();
-            match c.relation {
-                Relation::Le => lhs <= c.rhs,
-                Relation::Ge => lhs >= c.rhs,
-                Relation::Eq => lhs == c.rhs,
-            }
-        })
+    x.iter().enumerate().all(|(j, v)| match problem.sign(j) {
+        Sign::NonNegative => !v.is_negative(),
+        Sign::NonPositive => !v.is_positive(),
+        _ => true,
+    }) && problem.constraints.iter().all(|c| {
+        let lhs: Rational = c.coeffs.iter().zip(x).map(|(a, v)| a * v).sum();
+        match c.relation {
+            Relation::Le => lhs <= c.rhs,
+            Relation::Ge => lhs >= c.rhs,
+            Relation::Eq => lhs == c.rhs,
+        }
+    })
 }
 
 /// Best objective over all basic feasible solutions, or `None` if there are none.
 fn best_vertex(problem: &Problem) -> Option<Rational> {
     let n = problem.num_vars();
-    // Hyperplanes: every constraint, plus x_j = 0 for each variable.
+    // Hyperplanes: every constraint, plus x_j = 0 for each sign-restricted variable.
     let mut planes: Vec<(Vec<Rational>, Rational)> = problem
         .constraints
         .iter()
         .map(|c| (c.coeffs.clone(), c.rhs.clone()))
         .collect();
-    for j in 0..n {
+    for j in (0..n).filter(|&j| problem.sign(j) != Sign::Free) {
         let mut e = vec![ratio(0, 1); n];
         e[j] = ratio(1, 1);
         planes.push((e, ratio(0, 1)));
@@ -253,9 +318,32 @@ enum Expected {
     Unbounded,
 }
 
-fn reference(problem: &Problem) -> Expected {
+/// `problem` inside a box of size `k` that bounds every variable in the directions it may
+/// grow: `sum of |x_j| <= k` over the sign-restricted variables (with only non-negative ones,
+/// `x1 + ... + xn <= k`), plus `-k <= x_j <= k` for each free one. The boxes are nested and
+/// scale with `k`, so the boxed optimum is concave and monotone in `k`.
+fn boxed(problem: &Problem, k: i64) -> Problem {
     let n = problem.num_vars();
-    let boxed = |k: i64| best_vertex(&problem.clone().subject_to(vec![1; n], Relation::Le, k));
+    let signs: Vec<i64> = (0..n)
+        .map(|j| match problem.sign(j) {
+            Sign::NonNegative => 1,
+            Sign::NonPositive => -1,
+            _ => 0,
+        })
+        .collect();
+    let mut boxed = problem.clone().subject_to(signs, Relation::Le, k);
+    for j in (0..n).filter(|&j| problem.sign(j) == Sign::Free) {
+        for direction in [1, -1] {
+            let mut e = vec![0; n];
+            e[j] = direction;
+            boxed = boxed.subject_to(e, Relation::Le, k);
+        }
+    }
+    boxed
+}
+
+fn reference(problem: &Problem) -> Expected {
+    let boxed = |k: i64| best_vertex(&boxed(problem, k));
     match (boxed(BIG_K), boxed(2 * BIG_K)) {
         (None, None) => Expected::Infeasible,
         (Some(a), Some(b)) if a == b => Expected::Optimal(a),
@@ -268,8 +356,7 @@ fn reference(problem: &Problem) -> Expected {
 /// right-hand sides were changed from a problem with an optimum (unboundedness depends only
 /// on the recession directions, which do not depend on the right-hand sides).
 fn reference_bounded(problem: &Problem) -> Expected {
-    let n = problem.num_vars();
-    match best_vertex(&problem.clone().subject_to(vec![1; n], Relation::Le, BIG_K)) {
+    match best_vertex(&boxed(problem, BIG_K)) {
         Some(v) => Expected::Optimal(v),
         None => Expected::Infeasible,
     }
@@ -306,6 +393,10 @@ struct Stats {
     reoptimize_infeasible: usize,
     reoptimize_from_rebased: usize,
     reoptimize_with_redundant: usize,
+    signed_optimal: usize,
+    free_basic_negative: usize,
+    free_nonbasic: usize,
+    non_positive_basic: usize,
 }
 
 /// Re-optimizes `previous` (optimal for `problem`) with the constraints `extended` appends,
@@ -392,11 +483,22 @@ fn check_reoptimize(
         .collect();
     let want: Vec<&String> = s.basic_variables.iter().collect();
     assert_eq!(old_basis, want, "{ctx}: previous basis");
-    for (r, &b) in first.basis[..kept_rows].iter().enumerate() {
-        if b < problem.num_vars() {
-            assert_eq!(first.rhs[r], old_values[b], "{ctx}: previous value kept");
-        }
-    }
+    // The previous values, rebuilt from the basic columns of the start.
+    let start_values: Vec<Rational> = columns_of(problem)
+        .iter()
+        .map(|cols| {
+            cols.iter()
+                .map(|(col, _, negated)| {
+                    let v = first.basis[..kept_rows]
+                        .iter()
+                        .position(|b| b == col)
+                        .map_or(ratio(0, 1), |r| first.rhs[r].clone());
+                    if *negated { -v } else { v }
+                })
+                .sum()
+        })
+        .collect();
+    assert_eq!(&start_values, old_values, "{ctx}: previous values kept");
     if all_satisfied {
         stats.reoptimize_satisfied += 1;
         assert_eq!(
@@ -463,8 +565,10 @@ fn check_sensitivity(
     ctx: &str,
 ) {
     let n = problem.num_vars();
+    let columns = columns_of(problem);
+    let real_columns: usize = columns.iter().map(Vec::len).sum();
     let last = solution.trace.tableaus().last().unwrap();
-    let is_artificial = |j: usize| j >= n && last.columns[j].starts_with('a');
+    let is_artificial = |j: usize| j >= real_columns && last.columns[j].starts_with('a');
     let redundant_row =
         |i: usize| (0..last.columns.len()).all(|j| is_artificial(j) || last.rows[i][j].is_zero());
 
@@ -504,9 +608,11 @@ fn check_sensitivity(
     for (j, v) in s.variables.iter().enumerate() {
         assert_eq!(v.name, problem.var_name(j), "{ctx}");
         assert_eq!(v.value, values[j], "{ctx}: value of x{}", j + 1);
+        let cols = &columns[j];
         assert_eq!(
             v.basic,
-            s.basic_variables.contains(&v.name),
+            cols.iter()
+                .any(|(_, name, _)| s.basic_variables.contains(name)),
             "{ctx}: basic flag of x{}",
             j + 1
         );
@@ -519,17 +625,39 @@ fn check_sensitivity(
             - &problem.objective[j];
         assert_eq!(v.reduced_cost, d, "{ctx}: reduced cost of x{}", j + 1);
         if let Some(last) = tableau {
-            assert_eq!(v.reduced_cost, last.z[j].c, "{ctx}: tableau reduced cost");
-            assert!(last.z[j].m.is_zero(), "{ctx}");
+            // Each column shows the reduced cost, negated if it enters negated.
+            for (col, name, negated) in cols {
+                assert_eq!(&last.columns[*col], name, "{ctx}");
+                let want = if *negated { -d.clone() } else { d.clone() };
+                assert_eq!(
+                    last.z[*col].c, want,
+                    "{ctx}: tableau reduced cost of {name}"
+                );
+                assert!(last.z[*col].m.is_zero(), "{ctx}");
+            }
         }
         assert!(!v.basic || d.is_zero(), "{ctx}");
         assert!(v.basic || v.value.is_zero(), "{ctx}");
-        let dual_feasible = if maximize {
-            !d.is_negative()
-        } else {
-            !d.is_positive()
+        // Dual feasibility of every column: d for x, -d for x-, both for a free variable.
+        let ok = |d: &Rational| {
+            if maximize {
+                !d.is_negative()
+            } else {
+                !d.is_positive()
+            }
+        };
+        let dual_feasible = match problem.sign(j) {
+            Sign::NonNegative => ok(&d),
+            Sign::NonPositive => ok(&-d.clone()),
+            _ => d.is_zero(),
         };
         assert!(dual_feasible, "{ctx}: dual infeasible");
+        match problem.sign(j) {
+            Sign::Free if v.basic && v.value.is_negative() => stats.free_basic_negative += 1,
+            Sign::Free if !v.basic => stats.free_nonbasic += 1,
+            Sign::NonPositive if v.basic => stats.non_positive_basic += 1,
+            _ => {}
+        }
         assert!(v.cost_range.contains(&problem.objective[j]), "{ctx}");
     }
 
@@ -592,11 +720,31 @@ fn check_sensitivity(
         .sum();
     assert_eq!(&dual_objective, objective, "{ctx}: strong duality");
     if let Some(last) = tableau {
-        let degenerate =
-            (0..last.rows.len()).any(|i| !is_artificial(last.basis[i]) && last.rhs[i].is_zero());
+        // A free variable at zero is not a degeneracy: it can move both ways.
+        let free_column = |j: usize| {
+            columns
+                .iter()
+                .enumerate()
+                .any(|(v, cols)| problem.sign(v) == Sign::Free && cols.iter().any(|c| c.0 == j))
+        };
+        let degenerate = (0..last.rows.len()).any(|i| {
+            let b = last.basis[i];
+            !is_artificial(b) && !free_column(b) && last.rhs[i].is_zero()
+        });
         assert_eq!(s.degenerate, degenerate, "{ctx}: degenerate flag");
-        let alternative = (0..last.columns.len())
-            .any(|j| !is_artificial(j) && !last.basis.contains(&j) && last.z[j].is_zero());
+        // A free variable's column whose twin is basic does not make another optimum.
+        let twin_basic = |j: usize| {
+            columns.iter().any(|cols| {
+                cols.len() == 2
+                    && cols.iter().any(|(c, _, _)| *c == j)
+                    && cols
+                        .iter()
+                        .any(|(c, _, _)| *c != j && last.basis.contains(c))
+            })
+        };
+        let alternative = (0..last.columns.len()).any(|j| {
+            !is_artificial(j) && !last.basis.contains(&j) && last.z[j].is_zero() && !twin_basic(j)
+        });
         assert_eq!(
             s.alternative_optima, alternative,
             "{ctx}: alternative optima flag"
@@ -947,6 +1095,8 @@ fn matches_brute_force_on_random_problems() {
         })
         .collect();
     cases.extend((0..DUAL_CASES).map(|_| random_dual_feasible(&mut dual_rng)));
+    let mut signed_rng = Rng(0x5167_5EED_0000_0004);
+    cases.extend((0..SIGNED_CASES).map(|_| random_signed(&mut signed_rng)));
 
     for (case, problem) in cases.into_iter().enumerate() {
         let expected = reference(&problem);
@@ -1042,6 +1192,7 @@ fn matches_brute_force_on_random_problems() {
                             &problem, method, &solution, objective, values, &mut seen, &mut stats,
                             &ctx,
                         );
+                        stats.signed_optimal += !problem.signs.is_empty() as usize;
                         if let Some((extended, expected)) = &extension {
                             check_reoptimize(
                                 &problem,
@@ -1094,4 +1245,8 @@ fn matches_brute_force_on_random_problems() {
     assert!(stats.reoptimize_infeasible >= 50, "{stats:#?}");
     assert!(stats.reoptimize_from_rebased >= 5, "{stats:#?}");
     assert!(stats.reoptimize_with_redundant >= 5, "{stats:#?}");
+    assert!(stats.signed_optimal >= 200, "{stats:#?}");
+    assert!(stats.free_basic_negative >= 50, "{stats:#?}");
+    assert!(stats.free_nonbasic >= 20, "{stats:#?}");
+    assert!(stats.non_positive_basic >= 50, "{stats:#?}");
 }

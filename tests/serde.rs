@@ -403,3 +403,42 @@ fn reoptimize_works_from_a_deserialized_solution() {
         }
     );
 }
+
+#[test]
+fn signs_format() {
+    let problem = Problem::maximize([2, 1, 1])
+        .subject_to([1, 1, 1], Relation::Le, 4)
+        .free(1)
+        .non_positive(2);
+    let value = serde_json::to_value(&problem).unwrap();
+    assert_eq!(
+        value["signs"],
+        json!(["non_negative", "free", "non_positive"])
+    );
+    let back: Problem = serde_json::from_value(value).unwrap();
+    assert_eq!(back, problem);
+    // Omitted means all non-negative; a solution carries the signs of its problem.
+    let plain: Problem =
+        serde_json::from_str(r#"{ "sense": "maximize", "objective": ["1"], "constraints": [] }"#)
+            .unwrap();
+    assert!(plain.signs.is_empty());
+    let solution = solve(
+        &problem.clone().subject_to([1, 0, 0], Relation::Le, 3),
+        Method::Simplex,
+        &Options::default(),
+    )
+    .unwrap();
+    assert_eq!(to_value(&solution)["problem"]["signs"][1], json!("free"));
+}
+
+#[test]
+fn rational_is_an_exact_string() {
+    let r = ratio(-7, 3);
+    assert_eq!(serde_json::to_value(&r).unwrap(), json!("-7/3"));
+    assert_eq!(
+        serde_json::from_str::<simplex_trace::Rational>(r#"" 5/10 ""#).unwrap(),
+        ratio(1, 2)
+    );
+    assert!(serde_json::from_str::<simplex_trace::Rational>("0.5").is_err());
+    assert!(serde_json::from_str::<simplex_trace::Rational>(r#""0.5""#).is_err());
+}

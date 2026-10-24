@@ -281,7 +281,11 @@ fn check_sensitivity(
             .filter(|&&b| !is_artificial(b))
             .map(|&b| &last.columns[b])
             .collect();
-        assert_eq!(s.basis.iter().collect::<Vec<_>>(), names, "{ctx}: basis");
+        assert_eq!(
+            s.basic_variables.iter().collect::<Vec<_>>(),
+            names,
+            "{ctx}: basis"
+        );
     } else {
         stats.sensitivity_rebased += 1;
     }
@@ -296,7 +300,7 @@ fn check_sensitivity(
         assert_eq!(v.value, values[j], "{ctx}: value of x{}", j + 1);
         assert_eq!(
             v.basic,
-            s.basis.contains(&v.name),
+            s.basic_variables.contains(&v.name),
             "{ctx}: basic flag of x{}",
             j + 1
         );

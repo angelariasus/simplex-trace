@@ -137,7 +137,7 @@ A solution carries its status at the top level, next to the trace. Each step has
 
 ```json
 { "status": "optimal", "objective": "17/5", "values": ["2/5", "9/5"],
-  "sensitivity": { "basis": [...], "constraints": [...], "variables": [...], ... },
+  "sensitivity": { "basic_variables": [...], "constraints": [...], "variables": [...], ... },
   "trace": { "sense": "minimize", "steps": [ ... ] } }
 
 { "status": "infeasible", "trace": { ... } }

@@ -262,7 +262,7 @@ fn sensitivity_format() {
     let solution = solve(&problem, Method::Simplex, &Options::default()).unwrap();
     let value = to_value(&solution);
     let s = &value["sensitivity"];
-    assert_eq!(s["basis"], json!(["s1", "x2", "x1"]));
+    assert_eq!(s["basic_variables"], json!(["s1", "x2", "x1"]));
     assert_eq!(s["from_final_tableau"], json!(true));
     assert_eq!(s["degenerate"], json!(false));
     assert_eq!(s["alternative_optima"], json!(false));

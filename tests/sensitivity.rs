@@ -84,7 +84,7 @@ fn wyndor_matches_hillier() {
             );
             assert_eq!(sources(&s), ["s1", "s2", "s3"]);
             // The same basis, in the row order of the final tableau.
-            let mut basis = s.basis.clone();
+            let mut basis = s.basic_variables.clone();
             basis.sort();
             assert_eq!(basis, ["s1", "x1", "x2"]);
             assert!(s.from_final_tableau && !s.degenerate && !s.alternative_optima);
@@ -199,7 +199,7 @@ fn big_m_with_a_stuck_artificial_uses_an_equivalent_basis() {
     let s = solution.sensitivity.unwrap();
     assert!(!s.from_final_tableau);
     assert!(s.degenerate);
-    assert!(!s.basis.iter().any(|name| name.starts_with('a')));
+    assert!(!s.basic_variables.iter().any(|name| name.starts_with('a')));
     // No cell of the shown tableau holds these prices.
     assert_eq!(sources(&s), ["-", "-", "-"]);
     // Same solution, and the prices are dual feasible with zero duality gap.

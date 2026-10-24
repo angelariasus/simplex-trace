@@ -35,7 +35,7 @@ use crate::trace::write_table;
 #[non_exhaustive]
 pub struct Sensitivity {
     /// Basic variables of the basis the analysis is read from, one per non-redundant row.
-    pub basis: Vec<String>,
+    pub basic_variables: Vec<String>,
     /// The analysis is read from the final tableau of the trace (minus the rows of redundant
     /// equalities), so every [`Source`] points at one of its cells.
     ///
@@ -474,7 +474,7 @@ pub(crate) fn analyze(
         .collect();
 
     Some(Sensitivity {
-        basis: basis.iter().map(|&j| start.names[j].clone()).collect(),
+        basic_variables: basis.iter().map(|&j| start.names[j].clone()).collect(),
         from_final_tableau: matches!(cells, Cells::FinalTableau { .. }),
         constraints,
         variables,

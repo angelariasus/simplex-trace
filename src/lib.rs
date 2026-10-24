@@ -7,6 +7,9 @@
 //! Supported methods: primal simplex, Big-M (with a symbolic `M`) and two-phase.
 //! All variables are non-negative.
 //!
+//! With the **`serde`** feature, [`Problem`], [`Solution`], [`Trace`] and every [`Step`] can be
+//! (de)serialized, e.g. to JSON for a web front end. Numbers are exact strings such as `"3/2"`.
+//!
 //! ```
 //! use simplex_trace::{solve, Method, Options, Problem, Relation, Status, ratio};
 //!
@@ -31,6 +34,8 @@
 mod error;
 mod num;
 mod problem;
+#[cfg(feature = "serde")]
+mod serde_rational;
 mod solver;
 mod trace;
 
@@ -38,4 +43,4 @@ pub use error::Error;
 pub use num::{Coef, IntoRational, Rational, ratio};
 pub use problem::{Constraint, Problem, Relation, Sense};
 pub use solver::{Method, Options, PivotRule, Solution, Status, solve};
-pub use trace::{Phase, RatioTest, Snapshot, Step, Termination, Trace};
+pub use trace::{NamedValue, Phase, RatioTest, Snapshot, Step, Termination, Trace};

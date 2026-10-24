@@ -5,6 +5,7 @@ use std::fmt;
 /// Infeasible and unbounded problems are *not* errors: they are reported
 /// through [`Status`](crate::Status).
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Error {
     /// The problem is malformed (e.g. a constraint with the wrong number of coefficients).
     InvalidProblem(String),

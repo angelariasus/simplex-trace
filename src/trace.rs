@@ -4,6 +4,8 @@ use crate::num::{Coef, Rational};
 use crate::problem::Sense;
 
 /// Stage of the algorithm a step belongs to.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
     /// Plain simplex or Big-M: one optimization.
@@ -31,7 +33,9 @@ impl fmt::Display for Phase {
 /// `z_rhs` is the real objective value. A maximization tableau is optimal when every
 /// `z_j - c_j >= 0`; a minimization tableau when every `z_j - c_j <= 0` (see
 /// [`Snapshot::is_optimal`]).
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Snapshot {
     /// Sense of the objective in this tableau. Phase 1 of the two-phase method is always
     /// [`Sense::Minimize`] (it minimizes `r`, the sum of the artificial variables).
@@ -43,8 +47,10 @@ pub struct Snapshot {
     /// For each constraint row, the index of its basic column.
     pub basis: Vec<usize>,
     /// Constraint rows, without the right-hand side.
+    #[cfg_attr(feature = "serde", serde(with = "crate::serde_rational::vec_vec"))]
     pub rows: Vec<Vec<Rational>>,
     /// Right-hand side of each constraint row.
+    #[cfg_attr(feature = "serde", serde(with = "crate::serde_rational::vec"))]
     pub rhs: Vec<Rational>,
     /// Objective row, `z_j - c_j` per column (may contain the symbolic `M`).
     pub z: Vec<Coef>,
@@ -64,14 +70,35 @@ impl Snapshot {
 }
 
 /// One entry of the minimum-ratio test.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct RatioTest {
     pub row: usize,
     /// `rhs / pivot-column entry`, or `None` when the entry is `<= 0` (row not eligible).
+    #[cfg_attr(feature = "serde", serde(with = "crate::serde_rational::option"))]
     pub ratio: Option<Rational>,
 }
 
+/// A variable name with its value.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct NamedValue {
+    pub name: String,
+    #[cfg_attr(feature = "serde", serde(with = "crate::serde_rational::one"))]
+    pub value: Rational,
+}
+
+impl NamedValue {
+    pub(crate) fn new(name: String, value: Rational) -> Self {
+        NamedValue { name, value }
+    }
+}
+
 /// How a run ended.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Termination {
     Optimal,
@@ -80,15 +107,24 @@ pub enum Termination {
 }
 
 /// One recorded event.
+///
+/// New kinds of steps (for example from future methods) may be added in minor releases, so
+/// matches on `Step` need a wildcard arm. With the `serde` feature, a step is a JSON object
+/// whose `"type"` field is the variant name in `snake_case` (`"tableau"`, `"pivot"`, ...).
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(tag = "type", rename_all = "snake_case"))]
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Step {
     /// The tableau at the start of an iteration (`iteration` starts at 0).
+    #[non_exhaustive]
     Tableau {
         phase: Phase,
         iteration: usize,
         snapshot: Snapshot,
     },
     /// A pivot: which column enters, which row leaves, and the ratio test behind the choice.
+    #[non_exhaustive]
     Pivot {
         phase: Phase,
         iteration: usize,
@@ -97,36 +133,45 @@ pub enum Step {
         leaving_row: usize,
         leaving: usize,
         leaving_name: String,
+        #[cfg_attr(feature = "serde", serde(with = "crate::serde_rational::one"))]
         pivot_value: Rational,
         ratios: Vec<RatioTest>,
     },
     /// Phase 1 of the two-phase method finished.
+    #[non_exhaustive]
     PhaseOneFinished {
+        #[cfg_attr(feature = "serde", serde(with = "crate::serde_rational::one"))]
         artificial_sum: Rational,
         feasible: bool,
     },
     /// A zero-valued artificial variable was swapped out of the basis.
+    #[non_exhaustive]
     ArtificialPivotedOut {
         row: usize,
         entering: usize,
         entering_name: String,
     },
     /// A row whose basic variable was artificial and had no usable column: it was redundant.
+    #[non_exhaustive]
     RedundantRowRemoved { row: usize },
     /// Big-M: the penalty row (`M` part) can no longer improve, yet some artificial variables
     /// are still positive, so the problem is infeasible. `unbounded_direction` is `true` when
     /// the run stopped at an unbounded direction rather than at an optimal tableau.
+    #[non_exhaustive]
     ArtificialRemainsPositive {
-        /// `(name, value)` of each positive artificial variable.
-        artificials: Vec<(String, Rational)>,
+        /// Each positive artificial variable and its value.
+        artificials: Vec<NamedValue>,
         unbounded_direction: bool,
     },
     /// Final outcome.
-    Finished(Termination),
+    #[non_exhaustive]
+    Finished { termination: Termination },
 }
 
 /// The ordered list of everything the solver did.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Trace {
     pub sense: Sense,
     pub steps: Vec<Step>,
@@ -158,6 +203,14 @@ impl Trace {
             Step::Tableau { snapshot, .. } => Some(snapshot),
             _ => None,
         })
+    }
+
+    /// How the run ended (the last step).
+    pub fn termination(&self) -> Option<Termination> {
+        match self.steps.last() {
+            Some(Step::Finished { termination }) => Some(*termination),
+            _ => None,
+        }
     }
 }
 
@@ -277,7 +330,7 @@ impl fmt::Display for Trace {
                 } => {
                     let list: Vec<String> = artificials
                         .iter()
-                        .map(|(name, value)| format!("{name} = {value}"))
+                        .map(|a| format!("{} = {}", a.name, a.value))
                         .collect();
                     let stop = if *unbounded_direction {
                         "an unbounded direction was found"
@@ -294,7 +347,7 @@ impl fmt::Display for Trace {
                         }
                     )?;
                 }
-                Step::Finished(t) => writeln!(f, "== {t:?} ==")?,
+                Step::Finished { termination } => writeln!(f, "== {termination:?} ==")?,
             }
             writeln!(f)?;
         }

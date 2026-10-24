@@ -290,6 +290,7 @@ fn check_trace(
                         };
                         assert_eq!(Some(&t.z[*entering]), best, "{ctx}: Dantzig");
                     }
+                    other => panic!("{ctx}: pivot rule not covered by the oracle: {other:?}"),
                 }
 
                 assert_eq!(ratios.len(), t.rows.len(), "{ctx}");
@@ -318,11 +319,13 @@ fn check_trace(
             Step::ArtificialRemainsPositive {
                 artificials,
                 unbounded_direction,
+                ..
             } => {
                 let t = current.expect("diagnosis before any tableau");
                 assert_eq!(solution.status, Status::Infeasible, "{ctx}");
                 assert!(!artificials.is_empty(), "{ctx}");
-                for (name, value) in artificials {
+                for a in artificials {
+                    let (name, value) = (&a.name, &a.value);
                     assert!(value.is_positive(), "{ctx}: {name} = {value}");
                     let row = t
                         .basis
@@ -344,7 +347,8 @@ fn check_trace(
                     stats.big_m_infeasible_at_optimum += 1;
                 }
             }
-            Step::PhaseOneFinished { .. } | Step::Finished(_) => {}
+            Step::PhaseOneFinished { .. } | Step::Finished { .. } => {}
+            other => panic!("{ctx}: step not covered by the oracle: {other:?}"),
         }
     }
 
@@ -353,11 +357,11 @@ fn check_trace(
         Status::Infeasible => Termination::Infeasible,
         Status::Unbounded => Termination::Unbounded,
     };
-    assert_eq!(
-        solution.trace.steps.last(),
-        Some(&Step::Finished(termination)),
-        "{ctx}"
+    assert!(
+        matches!(solution.trace.steps.last(), Some(Step::Finished { .. })),
+        "{ctx}: last step is not Finished"
     );
+    assert_eq!(solution.trace.termination(), Some(termination), "{ctx}");
 }
 
 #[test]
@@ -381,10 +385,7 @@ fn matches_brute_force_on_random_problems() {
         for method in [Method::Simplex, Method::BigM, Method::TwoPhase] {
             for rule in [PivotRule::Dantzig, PivotRule::Bland] {
                 let ctx = format!("case {case} {method:?} {rule:?}\n{problem:?}");
-                let options = Options {
-                    pivot_rule: rule,
-                    ..Options::default()
-                };
+                let options = Options::default().pivot_rule(rule);
                 let solution = match solve(&problem, method, &options) {
                     Ok(solution) => solution,
                     Err(Error::ArtificialVariablesRequired) if method == Method::Simplex => {

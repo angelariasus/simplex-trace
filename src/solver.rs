@@ -3,10 +3,15 @@ use num_traits::{One, Signed, Zero};
 use crate::error::Error;
 use crate::num::{Coef, Rational};
 use crate::problem::{Problem, Relation, Sense};
-use crate::trace::{Phase, RatioTest, Snapshot, Step, Termination, Trace};
+use crate::trace::{NamedValue, Phase, RatioTest, Snapshot, Step, Termination, Trace};
 
 /// Which variant of the simplex method to run.
+///
+/// More methods (such as the dual simplex) may be added in minor releases.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Method {
     /// Primal simplex. Only for problems whose constraints are all `<=` with a non-negative
     /// right-hand side after normalization (the slacks give the starting basis).
@@ -18,7 +23,10 @@ pub enum Method {
 }
 
 /// Rule for choosing the entering column.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum PivotRule {
     /// The textbook rule: the most negative `z_j - c_j` when maximizing, the most positive
     /// when minimizing. Ties go to the lowest column index.
@@ -28,7 +36,17 @@ pub enum PivotRule {
 }
 
 /// Solver settings.
-#[derive(Clone, Debug)]
+///
+/// ```
+/// use simplex_trace::{Options, PivotRule};
+///
+/// let options = Options::default().pivot_rule(PivotRule::Bland).max_iterations(500);
+/// assert_eq!(options.pivot_rule, PivotRule::Bland);
+/// ```
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(default))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Options {
     pub pivot_rule: PivotRule,
     /// Maximum number of pivots per phase before giving up with [`Error::IterationLimit`].
@@ -44,12 +62,31 @@ impl Default for Options {
     }
 }
 
+impl Options {
+    pub fn pivot_rule(mut self, rule: PivotRule) -> Self {
+        self.pivot_rule = rule;
+        self
+    }
+
+    pub fn max_iterations(mut self, n: usize) -> Self {
+        self.max_iterations = n;
+        self
+    }
+}
+
 /// Final result of a solve.
+///
+/// With the `serde` feature: `{"status": "optimal", "objective": "17/5", "values": ["2/5", "9/5"]}`,
+/// `{"status": "infeasible"}` or `{"status": "unbounded"}`.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(tag = "status", rename_all = "snake_case"))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Status {
     /// `values` holds one entry per original variable; `objective` is in the problem's own sense.
     Optimal {
+        #[cfg_attr(feature = "serde", serde(with = "crate::serde_rational::one"))]
         objective: Rational,
+        #[cfg_attr(feature = "serde", serde(with = "crate::serde_rational::vec"))]
         values: Vec<Rational>,
     },
     Infeasible,
@@ -57,8 +94,14 @@ pub enum Status {
 }
 
 /// The status plus the full step-by-step trace that produced it.
-#[derive(Clone, Debug)]
+///
+/// With the `serde` feature the status fields sit at the top level:
+/// `{"status": "optimal", "objective": "17/5", "values": [...], "trace": {...}}`.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Solution {
+    #[cfg_attr(feature = "serde", serde(flatten))]
     pub status: Status,
     pub trace: Trace,
 }
@@ -104,23 +147,18 @@ pub fn solve(problem: &Problem, method: Method, options: &Options) -> Result<Sol
         }
     };
 
-    let status = match status {
+    let (status, termination) = match status {
         End::Optimal => {
-            trace.push(Step::Finished(Termination::Optimal));
-            Status::Optimal {
+            let status = Status::Optimal {
                 objective: t.z_rhs.c.clone(),
                 values: t.values(problem.num_vars()),
-            }
+            };
+            (status, Termination::Optimal)
         }
-        End::Infeasible => {
-            trace.push(Step::Finished(Termination::Infeasible));
-            Status::Infeasible
-        }
-        End::Unbounded => {
-            trace.push(Step::Finished(Termination::Unbounded));
-            Status::Unbounded
-        }
+        End::Infeasible => (Status::Infeasible, Termination::Infeasible),
+        End::Unbounded => (Status::Unbounded, Termination::Unbounded),
     };
+    trace.push(Step::Finished { termination });
     Ok(Solution { status, trace })
 }
 
@@ -170,7 +208,7 @@ impl Tableau {
             })
             .collect();
 
-        let mut names = problem.var_names.clone();
+        let mut names: Vec<String> = (0..n).map(|j| problem.var_name(j)).collect();
         let mut slack_col = vec![None; normalized.len()];
         for (i, (_, relation, _)) in normalized.iter().enumerate() {
             if *relation != Relation::Eq {
@@ -405,11 +443,11 @@ impl Tableau {
         }
     }
 
-    /// Basic artificial variables with a positive value, as `(name, value)`.
-    fn positive_artificials(&self) -> Vec<(String, Rational)> {
+    /// Basic artificial variables with a positive value.
+    fn positive_artificials(&self) -> Vec<NamedValue> {
         (0..self.rows.len())
             .filter(|&i| self.artificial[self.basis[i]] && self.rhs[i].is_positive())
-            .map(|i| (self.names[self.basis[i]].clone(), self.rhs[i].clone()))
+            .map(|i| NamedValue::new(self.names[self.basis[i]].clone(), self.rhs[i].clone()))
             .collect()
     }
 

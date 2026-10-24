@@ -48,11 +48,16 @@ pub fn ratio(n: i64, d: i64) -> Rational {
 ///
 /// Ordering is lexicographic (`M` dominates), which is exactly what the Big-M method needs
 /// without picking a numeric value for `M`. With `m == 0` it is an ordinary rational.
+///
+/// With the `serde` feature it is `{"m": "7", "c": "-4"}` for `7M - 4`.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Coef {
     /// Coefficient of `M`.
+    #[cfg_attr(feature = "serde", serde(with = "crate::serde_rational::one"))]
     pub m: Rational,
     /// Constant part.
+    #[cfg_attr(feature = "serde", serde(with = "crate::serde_rational::one"))]
     pub c: Rational,
 }
 

@@ -1,5 +1,6 @@
 use simplex_trace::{
-    Error, Method, Options, PivotRule, Problem, Relation, Status, Step, Termination, ratio, solve,
+    Error, Method, Options, PivotRule, Problem, Rational, Relation, Solution, Status, Step,
+    Termination, ratio, solve,
 };
 
 fn optimal(objective: (i64, i64), values: &[(i64, i64)]) -> Status {
@@ -59,10 +60,7 @@ fn wyndor_trace_matches_the_textbook() {
         [("x2".into(), "s2".into()), ("x1".into(), "s3".into())]
     );
     assert_eq!(solution.trace.tableaus().count(), 3);
-    assert_eq!(
-        solution.trace.steps.last(),
-        Some(&Step::Finished(Termination::Optimal))
-    );
+    assert_eq!(solution.trace.termination(), Some(Termination::Optimal));
 
     let first = solution.trace.tableaus().next().unwrap();
     assert_eq!(first.columns, ["x1", "x2", "s1", "s2", "s3"]);
@@ -116,10 +114,7 @@ fn infeasible_is_detected() {
     for method in [Method::BigM, Method::TwoPhase] {
         let solution = solve(&problem, method, &Options::default()).unwrap();
         assert_eq!(solution.status, Status::Infeasible, "{method:?}");
-        assert_eq!(
-            solution.trace.steps.last(),
-            Some(&Step::Finished(Termination::Infeasible))
-        );
+        assert_eq!(solution.trace.termination(), Some(Termination::Infeasible));
     }
 }
 
@@ -173,10 +168,7 @@ fn beale_cycling_example_terminates_with_bland() {
         .subject_to([(1, 4), (-60, 1), (-1, 25), (9, 1)], Relation::Le, 0)
         .subject_to([(1, 2), (-90, 1), (-1, 50), (3, 1)], Relation::Le, 0)
         .subject_to([(0, 1), (0, 1), (1, 1), (0, 1)], Relation::Le, 1);
-    let options = Options {
-        pivot_rule: PivotRule::Bland,
-        ..Options::default()
-    };
+    let options = Options::default().pivot_rule(PivotRule::Bland);
     let solution = solve(&problem, Method::Simplex, &options).unwrap();
     match solution.status {
         Status::Optimal { objective, .. } => assert_eq!(objective, ratio(1, 20)),
@@ -201,20 +193,12 @@ fn big_m_diagnoses_infeasibility_at_an_unbounded_direction() {
         .subject_to([-1, 0, 0], Relation::Ge, 1)
         .subject_to([0, 1, -1], Relation::Le, 1);
     for rule in [PivotRule::Dantzig, PivotRule::Bland] {
-        let options = Options {
-            pivot_rule: rule,
-            ..Options::default()
-        };
+        let options = Options::default().pivot_rule(rule);
         let solution = solve(&problem, Method::BigM, &options).unwrap();
         assert_eq!(solution.status, Status::Infeasible, "{rule:?}");
-        assert!(
-            solution
-                .trace
-                .steps
-                .contains(&Step::ArtificialRemainsPositive {
-                    artificials: vec![("a1".to_string(), ratio(1, 1))],
-                    unbounded_direction: true,
-                })
+        assert_eq!(
+            diagnosis(&solution),
+            Some((vec![("a1".to_string(), ratio(1, 1))], true))
         );
         assert!(solution.trace.to_string().contains(
             "an unbounded direction was found, but the M row cannot improve and a1 = 1 is still positive"
@@ -230,13 +214,27 @@ fn big_m_diagnoses_infeasibility_at_an_optimal_tableau() {
         .subject_to([1, 1], Relation::Le, 1)
         .subject_to([1, 1], Relation::Ge, 2);
     let solution = solve(&problem, Method::BigM, &Options::default()).unwrap();
-    assert!(
-        solution
-            .trace
-            .steps
-            .contains(&Step::ArtificialRemainsPositive {
-                artificials: vec![("a2".to_string(), ratio(1, 1))],
-                unbounded_direction: false,
-            })
+    assert_eq!(
+        diagnosis(&solution),
+        Some((vec![("a2".to_string(), ratio(1, 1))], false))
     );
+}
+
+/// The Big-M infeasibility diagnosis of a run: positive artificials and whether it stopped at
+/// an unbounded direction.
+fn diagnosis(solution: &Solution) -> Option<(Vec<(String, Rational)>, bool)> {
+    solution.trace.steps.iter().find_map(|s| match s {
+        Step::ArtificialRemainsPositive {
+            artificials,
+            unbounded_direction,
+            ..
+        } => Some((
+            artificials
+                .iter()
+                .map(|a| (a.name.clone(), a.value.clone()))
+                .collect(),
+            *unbounded_direction,
+        )),
+        _ => None,
+    })
 }

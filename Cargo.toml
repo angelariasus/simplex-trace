@@ -11,3 +11,18 @@ categories = ["mathematics", "science", "algorithms"]
 num-bigint = "0.4"
 num-rational = "0.4"
 num-traits = "0.2"
+serde = { version = "1", features = ["derive"], optional = true }
+
+[features]
+## Serialize and deserialize problems, solutions and traces (rationals as exact strings like "3/2").
+serde = ["dep:serde"]
+
+[dev-dependencies]
+serde_json = "1"
+
+[package.metadata.docs.rs]
+all-features = true
+
+[[example]]
+name = "json"
+required-features = ["serde"]

@@ -93,9 +93,11 @@ match the textbook line by line:
   Hillier & Lieberman's Wyndor Glass), so the presentation cannot change silently.
 - **Classic cases:** infeasible, unbounded, redundant equalities, negative right-hand sides,
   Beale's cycling example.
-- **Oracle:** Big-M and two-phase, under both pivot rules, are cross-checked against
-  brute-force vertex enumeration on 500 random problems, including that the final tableau is
-  optimal under its own sense and shows the real objective value.
+- **Oracle:** plain simplex, Big-M and two-phase, under both pivot rules, are cross-checked against
+  brute-force vertex enumeration on 600 random problems (optimal, infeasible, unbounded,
+  degenerate and redundant). Every recorded step is checked too: non-negative right-hand sides,
+  unit basic columns, the entering column chosen by the pivot rule, the minimum-ratio leaving row,
+  and that the final tableau is optimal under its own sense and shows the real objective value.
 
 ## Roadmap
 

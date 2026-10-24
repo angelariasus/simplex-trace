@@ -16,6 +16,7 @@ course: no `0.9999999`, no hidden iterations.
 - **Pivot rules:** Dantzig (textbook) or Bland (anti-cycling).
 - **Always conclusive:** every method reports optimal, infeasible or unbounded, and the trace
   says why.
+- **JSON** (optional `serde` feature): problems in, solutions and traces out, with exact numbers.
 - Pure Rust, no I/O, no unsafe.
 
 ## Example
@@ -70,6 +71,52 @@ z     |  0 |  0 |  0 |  3/2 |    1 |  36
 The text output is only a convenience: `solution.trace.steps` is a `Vec<Step>` you can walk
 to render the method in any UI.
 
+## JSON
+
+Enable the `serde` feature to send problems from a front end and get the whole trace back:
+
+```toml
+simplex-trace = { version = "0.1", features = ["serde"] }
+```
+
+Numbers are always **exact strings** (`"3"`, `"-1/2"`); JSON floats are rejected, so nothing
+is ever rounded. A problem (`var_names` is optional):
+
+```json
+{
+  "sense": "minimize",
+  "objective": ["4", "1"],
+  "constraints": [
+    { "coeffs": ["3", "1"], "relation": "=", "rhs": "3" },
+    { "coeffs": ["4", "3"], "relation": ">=", "rhs": "6" },
+    { "coeffs": ["1", "2"], "relation": "<=", "rhs": "4" }
+  ]
+}
+```
+
+A solution carries its status at the top level, next to the trace. Each step has a
+`"type"`; values that may contain the symbolic `M` are `{"m": "7", "c": "-4"}` (that is,
+`7M - 4`):
+
+```json
+{ "status": "optimal", "objective": "17/5", "values": ["2/5", "9/5"],
+  "trace": { "sense": "minimize", "steps": [ ... ] } }
+
+{ "status": "infeasible", "trace": { ... } }
+
+{ "type": "pivot", "phase": "single", "iteration": 0,
+  "entering": 0, "entering_name": "x1", "leaving_row": 0, "leaving": 4, "leaving_name": "a1",
+  "pivot_value": "3",
+  "ratios": [{ "row": 0, "ratio": "1" }, { "row": 1, "ratio": "3/2" }, { "row": 2, "ratio": "4" }] }
+
+{ "type": "finished", "termination": "optimal" }
+```
+
+Step types: `tableau`, `pivot`, `phase_one_finished`, `artificial_pivoted_out`,
+`redundant_row_removed`, `artificial_remains_positive`, `finished`. New types may appear in
+minor releases, so a UI should skip unknown ones. See `cargo run --example json --features serde`
+for a full trace.
+
 ## Conventions
 
 Tableaus follow the convention of Taha's *Operations Research: An Introduction*, so they
@@ -103,12 +150,13 @@ match the textbook line by line:
   degenerate and redundant). Every recorded step is checked too: non-negative right-hand sides,
   unit basic columns, the entering column chosen by the pivot rule, the minimum-ratio leaving row,
   and that the final tableau is optimal under its own sense and shows the real objective value.
+- **JSON contract** (`--features serde`): exact round trips, and the shape of problems,
+  statuses and steps is pinned by tests.
 
 ## Roadmap
 
 - Dual simplex
 - Sensitivity analysis (ranges, shadow prices) from the final tableau
-- Optional `serde` support for traces
 - Free (unrestricted-sign) variables
 
 ## License

@@ -1,7 +1,7 @@
 use std::fmt;
 
 use crate::num::Rational;
-use crate::problem::{Problem, Relation, Sense};
+use crate::problem::{Expansion, Problem, Relation, Sense, Sign};
 use crate::trace::write_table;
 
 /// Sensitivity analysis of an optimal solution, read from its final basis.
@@ -32,7 +32,9 @@ use crate::trace::write_table;
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Sensitivity {
-    /// Basic variables of the basis the analysis is read from, one per non-redundant row.
+    /// Basic columns of the basis the analysis is read from, one per non-redundant row, by
+    /// name: a variable, a slack (`s2`), or a part of a free or non-positive variable (`x1+`,
+    /// `x1-`).
     pub basic_variables: Vec<String>,
     /// The analysis is read from the final tableau of the trace (minus the rows of redundant
     /// equalities), so every [`Source`] points at one of its cells.
@@ -49,9 +51,11 @@ pub struct Sensitivity {
     pub variables: Vec<VariableSensitivity>,
     /// Some basic variable is zero. Shadow prices are then only valid in one direction
     /// (the right-hand-side range has an end at the current value) and may not be unique.
+    /// A free variable at zero does not count: it can move both ways.
     pub degenerate: bool,
     /// Some nonbasic column (variable or slack) has a zero reduced cost: other optimal
-    /// bases, and usually other optimal solutions, exist.
+    /// bases, and usually other optimal solutions, exist. The column of a free variable whose
+    /// other column is basic does not count: it only splits the same value differently.
     pub alternative_optima: bool,
 }
 
@@ -74,7 +78,9 @@ pub struct ConstraintSensitivity {
     /// The constraint holds with equality at the optimum (`slack == 0`).
     pub binding: bool,
     /// Values of `b_i` (all else equal) for which the final basis stays feasible, hence
-    /// optimal, with the same shadow prices. A single point `[b_i, b_i]` for a redundant
+    /// optimal, with the same shadow prices. A free variable may change sign inside the range
+    /// (its two columns trade places, which keeps the prices). A single point `[b_i, b_i]` for
+    /// a redundant
     /// equality and for the equalities it depends on: moving any of them alone makes the
     /// constraints inconsistent.
     pub rhs_range: Interval,
@@ -93,10 +99,13 @@ pub struct ConstraintSensitivity {
 pub struct VariableSensitivity {
     pub name: String,
     pub value: Rational,
-    /// The variable is in the final basis.
+    /// The variable (or one of its columns, if it is free or non-positive) is in the final
+    /// basis.
     pub basic: bool,
-    /// `z_j - c_j` in the final tableau (0 for basic variables). For a nonbasic variable it
-    /// is how much its cost must improve before it is worth producing.
+    /// `z_j - c_j = sum_i y_i a_ij - c_j`, which is `z_j - c_j` in the final tableau for a
+    /// non-negative variable (0 if basic). For a nonbasic variable it is how much its cost
+    /// must improve before it is worth producing. A non-positive variable's column `x-` shows
+    /// it negated; a free variable's columns show `+-` it, and at an optimum it is 0.
     pub reduced_cost: Rational,
     /// Values of the cost `c_j` (all else equal) for which the final basis, and so the
     /// current solution, stays optimal.
@@ -249,16 +258,19 @@ pub(crate) struct StandardForm<'a> {
 /// per kept row) from scratch: `B^-1` is rebuilt from the starting columns, so the result
 /// does not depend on which method reached the basis. `removed` lists redundant equalities,
 /// which have no row in the final tableau. `cells` tells where the shadow prices can be
-/// read, if anywhere.
+/// read, if anywhere. The tableau is that of `expansion.problem` (non-negative columns); the
+/// report speaks about the variables of `original`.
 ///
 /// Returns `None` if the basis matrix is singular, which would be a solver bug.
 pub(crate) fn analyze(
-    problem: &Problem,
+    original: &Problem,
+    expansion: &Expansion,
     start: StandardForm<'_>,
     basis: &[usize],
     removed: &[usize],
     cells: Cells,
 ) -> Option<Sensitivity> {
+    let problem = &expansion.problem;
     let n = problem.num_vars();
     let m = problem.constraints.len();
     let a = start.rows;
@@ -334,6 +346,16 @@ pub(crate) fn analyze(
     let values: Vec<Rational> = (0..n)
         .map(|j| row_of[j].map_or_else(Rational::zero, |r| xb[r].clone()))
         .collect();
+    // Columns of free variables: they have no sign of their own to protect, so reaching zero
+    // only means the variable changes sign (its twin column takes over, same prices).
+    let mut free_column = vec![false; real];
+    for (j, cols) in expansion.parts.iter().enumerate() {
+        if original.sign(j) == Sign::Free {
+            for &(col, _) in cols {
+                free_column[col] = true;
+            }
+        }
+    }
 
     let constraints = problem
         .constraints
@@ -366,12 +388,12 @@ pub(crate) fn analyze(
             };
 
             // Raising the normalized rhs by delta moves the basic values by delta * B^-1 e_k;
-            // the basis stays feasible while they are all >= 0.
+            // the basis stays feasible while they are all >= 0 (free variables aside).
             let mut lower: Option<Rational> = None;
             let mut upper: Option<Rational> = None;
             for (r, x) in xb.iter().enumerate() {
                 let u = &binv[r][k];
-                if u.is_zero() {
+                if u.is_zero() || free_column[basis[r]] {
                     continue;
                 }
                 let limit = -x / u;
@@ -422,56 +444,77 @@ pub(crate) fn analyze(
         })
         .collect();
 
-    let variables = (0..n)
-        .map(|j| {
-            let c = &problem.objective[j];
-            // Raising c_j by delta lowers z_j - c_j by delta (nonbasic), or moves every
-            // nonbasic z_l - c_l by delta * alpha[r][l] (basic in row r). The basis stays
-            // optimal while they keep the sign the sense requires.
-            let (lower, upper) = match row_of[j] {
-                None => match problem.sense {
-                    Sense::Maximize => (None, Some(d[j].clone())),
-                    Sense::Minimize => (Some(d[j].clone()), None),
-                },
-                Some(r) => {
-                    let mut lower: Option<Rational> = None;
-                    let mut upper: Option<Rational> = None;
-                    for &l in &nonbasic {
-                        let al = alpha(r, l);
-                        if al.is_zero() {
-                            continue;
-                        }
-                        let limit = -&d[l] / &al;
-                        let is_lower = match problem.sense {
-                            Sense::Maximize => al.is_positive(),
-                            Sense::Minimize => al.is_negative(),
-                        };
-                        if is_lower {
-                            lower = Some(lower.map_or(limit.clone(), |v| v.max(limit)));
-                        } else {
-                            upper = Some(upper.map_or(limit.clone(), |v| v.min(limit)));
-                        }
+    // `f * column` for a column that enters an original variable negated or not.
+    let signed = |negated: bool, v: &Rational| if negated { -v } else { v.clone() };
+    let variables = expansion
+        .parts
+        .iter()
+        .enumerate()
+        .map(|(j, cols)| {
+            let c = &original.objective[j];
+            // Raising c_j by delta raises the cost of each column by f * delta (f = -1 for a
+            // negated column). That moves every nonbasic z_l - c_l by delta * g_l, where g_l
+            // collects f * alpha[r][l] over the basic columns (row r) and -f if l is itself a
+            // column of the variable. The basis stays optimal while they keep the sign the
+            // sense requires.
+            let mut lower: Option<Rational> = None;
+            let mut upper: Option<Rational> = None;
+            for &l in &nonbasic {
+                let mut g = Rational::zero();
+                for &(col, negated) in cols {
+                    if let Some(r) = row_of[col] {
+                        g += signed(negated, &alpha(r, l));
+                    } else if col == l {
+                        g -= signed(negated, &Rational::one());
                     }
-                    (lower, upper)
                 }
-            };
+                if g.is_zero() {
+                    continue;
+                }
+                let limit = -&d[l] / &g;
+                let is_lower = match problem.sense {
+                    Sense::Maximize => g.is_positive(),
+                    Sense::Minimize => g.is_negative(),
+                };
+                if is_lower {
+                    lower = Some(lower.map_or(limit.clone(), |v| v.max(limit)));
+                } else {
+                    upper = Some(upper.map_or(limit.clone(), |v| v.min(limit)));
+                }
+            }
+            let (first, negated) = cols[0];
             VariableSensitivity {
-                name: start.names[j].clone(),
-                value: values[j].clone(),
-                basic: row_of[j].is_some(),
-                reduced_cost: d[j].clone(),
+                name: original.var_name(j),
+                value: cols
+                    .iter()
+                    .map(|&(col, neg)| signed(neg, &values[col]))
+                    .sum(),
+                basic: cols.iter().any(|&(col, _)| row_of[col].is_some()),
+                reduced_cost: signed(negated, &d[first]),
                 cost_range: Interval::around(c, lower, upper),
             }
         })
         .collect();
+    // The two columns of a free variable are opposite: when one is basic the other has a zero
+    // reduced cost that only describes splitting the same value differently.
+    let mut twin = vec![None; real];
+    for (j, cols) in expansion.parts.iter().enumerate() {
+        if original.sign(j) == Sign::Free {
+            twin[cols[0].0] = Some(cols[1].0);
+            twin[cols[1].0] = Some(cols[0].0);
+        }
+    }
+    let alternative_optima = nonbasic
+        .iter()
+        .any(|&l| d[l].is_zero() && !twin[l].is_some_and(|t: usize| row_of[t].is_some()));
 
     Some(Sensitivity {
         basic_variables: basis.iter().map(|&j| start.names[j].clone()).collect(),
         from_final_tableau: matches!(cells, Cells::FinalTableau { .. }),
         constraints,
         variables,
-        degenerate: xb.iter().any(Rational::is_zero),
-        alternative_optima: nonbasic.iter().any(|&l| d[l].is_zero()),
+        degenerate: (0..xb.len()).any(|r| xb[r].is_zero() && !free_column[basis[r]]),
+        alternative_optima,
     })
 }
 

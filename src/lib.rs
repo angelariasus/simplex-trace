@@ -5,7 +5,8 @@
 //! tool or UI can replay the method exactly as it is done by hand.
 //!
 //! Supported methods: primal simplex, Big-M (with a symbolic `M`), two-phase and dual simplex.
-//! All variables are non-negative. Every optimal solution includes a [`Sensitivity`] analysis
+//! Variables are non-negative unless declared free or non-positive (see [`Sign`]). Every
+//! optimal solution includes a [`Sensitivity`] analysis
 //! (shadow prices, reduced costs and ranges), and [`reoptimize`] repairs it with dual simplex
 //! pivots after constraints are added, instead of solving again.
 //!
@@ -45,7 +46,7 @@ mod trace;
 
 pub use error::Error;
 pub use num::{Coef, IntoRational, ratio};
-pub use problem::{Constraint, Problem, Relation, Sense};
+pub use problem::{Constraint, Problem, Relation, Sense, Sign};
 pub use rational::{ParseRationalError, Rational};
 pub use sensitivity::{ConstraintSensitivity, Interval, Sensitivity, Source, VariableSensitivity};
 pub use solver::{Method, Options, PivotRule, Solution, Status, reoptimize, solve};

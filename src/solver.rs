@@ -1,6 +1,6 @@
 use crate::error::Error;
 use crate::num::{Coef, Rational};
-use crate::problem::{Problem, Relation, Sense};
+use crate::problem::{Expansion, Problem, Relation, Sense, Sign};
 use crate::sensitivity::{self, Cells, Sensitivity, StandardForm};
 use crate::trace::{
     DualRatioTest, NamedValue, Phase, RatioTest, Snapshot, Step, Termination, Trace,
@@ -145,18 +145,22 @@ pub struct Solution {
 pub fn solve(problem: &Problem, method: Method, options: &Options) -> Result<Solution, Error> {
     problem.validate()?;
     let mut trace = Trace::new(problem.sense);
+    // Every method works on non-negative columns; free and non-positive variables are
+    // substituted here and combined back in `finish`.
+    let expansion = problem.expand();
+    let columns = &expansion.problem;
     let sense = problem.sense;
-    let costs = &problem.objective;
+    let costs = &columns.objective;
 
     if method == Method::DualSimplex {
         check_dual_feasible(problem)?;
-        let mut t = Tableau::dual_form(problem);
+        let mut t = Tableau::dual_form(columns);
         t.set_objective(sense, "z", costs, &Coef::zero());
         let end = t.optimize_dual(options, &mut trace)?;
-        return Ok(finish(&t, problem, end, trace));
+        return Ok(finish(&t, problem, &expansion, end, trace));
     }
 
-    let mut t = Tableau::standard_form(problem);
+    let mut t = Tableau::standard_form(columns);
     let end = match method {
         Method::Simplex if t.has_artificials() => return Err(Error::ArtificialVariablesRequired),
         Method::Simplex => t.single_phase(sense, costs, Coef::zero(), options, &mut trace)?,
@@ -174,7 +178,7 @@ pub fn solve(problem: &Problem, method: Method, options: &Options) -> Result<Sol
         }
         Method::DualSimplex => unreachable!("handled above"),
     };
-    Ok(finish(&t, problem, end, trace))
+    Ok(finish(&t, problem, &expansion, end, trace))
 }
 
 /// Re-optimizes a solved problem after appending constraints to it, with the dual simplex.
@@ -219,6 +223,7 @@ pub fn reoptimize(
     let same_prefix = problem.sense == old.sense
         && problem.objective == old.objective
         && problem.var_names == old.var_names
+        && (0..problem.num_vars()).all(|j| problem.sign(j) == old.sign(j))
         && problem.constraints.len() >= m
         && problem.constraints[..m] == old.constraints[..];
     if !same_prefix {
@@ -236,14 +241,17 @@ pub fn reoptimize(
     }
 
     let mut trace = Trace::new(problem.sense);
-    let mut t = Tableau::from_basis(old, sensitivity)?;
-    t.append_constraints(problem, m, &mut trace);
+    let expansion = problem.expand();
+    let mut t = Tableau::from_basis(&old.expand().problem, sensitivity)?;
+    t.append_constraints(&expansion.problem, m, &mut trace);
     let end = t.optimize_dual(options, &mut trace)?;
-    Ok(finish(&t, problem, end, trace))
+    Ok(finish(&t, problem, &expansion, end, trace))
 }
 
 /// The dual simplex needs the slack basis to be dual feasible: the starting objective row is
-/// `-c_j`, which has the optimal sign exactly when every cost has the right sign.
+/// `-c_j` for every column, which has the optimal sign exactly when every column cost has the
+/// right sign. A non-positive variable's column costs `-c_j`; a free variable has columns
+/// costing `c_j` and `-c_j`, so its cost must be zero.
 fn check_dual_feasible(problem: &Problem) -> Result<(), Error> {
     for (i, c) in problem.constraints.iter().enumerate() {
         if c.relation == Relation::Eq {
@@ -263,31 +271,54 @@ fn check_dual_feasible(problem: &Problem) -> Result<(), Error> {
             "non-negative",
         ),
     };
-    if let Some((j, c)) = problem.objective.iter().enumerate().find(|(_, c)| wrong(c)) {
-        return Err(Error::NotDualFeasible(format!(
-            "{} has cost {c}, but the costs must be {needs} when {}",
-            problem.var_name(j),
-            match problem.sense {
-                Sense::Maximize => "maximizing",
-                Sense::Minimize => "minimizing",
+    let when = match problem.sense {
+        Sense::Maximize => "maximizing",
+        Sense::Minimize => "minimizing",
+    };
+    for (j, c) in problem.objective.iter().enumerate() {
+        let name = problem.var_name(j);
+        match problem.sign(j) {
+            Sign::Free if !c.is_zero() => {
+                return Err(Error::NotDualFeasible(format!(
+                    "{name} is free and has cost {c}; its columns {name}+ and {name}- have opposite costs, so one of them always has the wrong sign unless the cost is 0"
+                )));
             }
-        )));
+            Sign::NonPositive if wrong(&-c) => {
+                return Err(Error::NotDualFeasible(format!(
+                    "{name} is non-positive and has cost {c}, so its column {name}- costs {}, but column costs must be {needs} when {when}",
+                    -c
+                )));
+            }
+            Sign::NonNegative if wrong(c) => {
+                return Err(Error::NotDualFeasible(format!(
+                    "{name} has cost {c}, but the costs must be {needs} when {when}"
+                )));
+            }
+            _ => {}
+        }
     }
     Ok(())
 }
 
 /// Builds the solution from the final tableau: status, sensitivity (if optimal) and the
-/// closing step of the trace.
-fn finish(t: &Tableau, problem: &Problem, end: End, mut trace: Trace) -> Solution {
+/// closing step of the trace, all in terms of the original variables.
+fn finish(
+    t: &Tableau,
+    problem: &Problem,
+    expansion: &Expansion,
+    end: End,
+    mut trace: Trace,
+) -> Solution {
     let sensitivity = match end {
-        End::Optimal => t.sensitivity(problem),
+        End::Optimal => t.sensitivity(problem, expansion),
         _ => None,
     };
     let (status, termination) = match end {
         End::Optimal => {
+            let columns = t.values(expansion.problem.num_vars());
             let status = Status::Optimal {
                 objective: t.z_rhs.c.clone(),
-                values: t.values(problem.num_vars()),
+                values: expansion.combine(&columns),
             };
             (status, Termination::Optimal)
         }
@@ -954,7 +985,7 @@ impl Tableau {
     /// pivoted out and the real objective re-optimized. Those pivots are all degenerate (the
     /// solution is already optimal, so no pivot can move it), so the analysis still describes
     /// the reported solution.
-    fn sensitivity(&self, problem: &Problem) -> Option<Sensitivity> {
+    fn sensitivity(&self, original: &Problem, expansion: &Expansion) -> Option<Sensitivity> {
         let mut removed = self.removed.clone();
         let mut basis = Vec::with_capacity(self.basis.len());
         for (i, &b) in self.basis.iter().enumerate() {
@@ -965,43 +996,49 @@ impl Tableau {
             let redundant =
                 (0..self.names.len()).all(|j| self.artificial[j] || self.rows[i][j].is_zero());
             if !redundant {
-                return self.rebased_sensitivity(problem);
+                return self.rebased_sensitivity(original, expansion);
             }
             removed.push(self.artificial_owner[b].expect("artificial column"));
         }
         let cells = Cells::FinalTableau {
             artificial_columns: self.has_artificials(),
         };
-        self.analyze(problem, &basis, &removed, cells)
+        self.analyze(original, expansion, &basis, &removed, cells)
     }
 
-    fn rebased_sensitivity(&self, problem: &Problem) -> Option<Sensitivity> {
+    fn rebased_sensitivity(
+        &self,
+        original: &Problem,
+        expansion: &Expansion,
+    ) -> Option<Sensitivity> {
+        let columns = &expansion.problem;
         let mut t = self.clone();
-        let mut scratch = Trace::new(problem.sense);
+        let mut scratch = Trace::new(columns.sense);
         t.drop_artificials(&mut scratch);
-        t.set_objective(problem.sense, "z", &problem.objective, &Coef::zero());
+        t.set_objective(columns.sense, "z", &columns.objective, &Coef::zero());
         let options = Options::default().pivot_rule(PivotRule::Bland);
         match t.optimize(Phase::Two, &options, &mut scratch) {
-            Ok(End::Optimal) => t.analyze(problem, &t.basis, &t.removed, Cells::None),
+            Ok(End::Optimal) => t.analyze(original, expansion, &t.basis, &t.removed, Cells::None),
             _ => None, // unreachable: the starting basis is feasible and optimal in value
         }
     }
 
     fn analyze(
         &self,
-        problem: &Problem,
+        original: &Problem,
+        expansion: &Expansion,
         basis: &[usize],
         removed: &[usize],
         cells: Cells,
     ) -> Option<Sensitivity> {
-        let start = Tableau::standard_form(problem);
+        let start = Tableau::standard_form(&expansion.problem);
         let form = StandardForm {
             rows: &start.rows,
             rhs: &start.rhs,
             names: &start.names,
             artificial: &start.artificial,
         };
-        sensitivity::analyze(problem, form, basis, removed, cells)
+        sensitivity::analyze(original, expansion, form, basis, removed, cells)
     }
 
     fn values(&self, n: usize) -> Vec<Rational> {

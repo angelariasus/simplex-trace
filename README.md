@@ -71,19 +71,31 @@ to render the method in any UI.
 
 ## Conventions
 
+Tableaus follow the convention of Taha's *Operations Research: An Introduction*, so they
+match the textbook line by line:
+
 - All variables are non-negative.
-- Minimization is solved as the equivalent maximization of `-c·x`; the objective row stores
-  `z_j - c_j` and a tableau is optimal when no entry is negative. The reported objective value
-  is always in the problem's own sense.
+- The problem is never silently converted: the objective row holds `z_j - c_j` with the real
+  costs, and its right-hand side is the real objective value.
+- **Maximize:** the most negative `z_j - c_j` enters; optimal when all are `>= 0`.
+  **Minimize:** the most positive enters; optimal when all are `<= 0`.
+  `Snapshot::is_optimal` applies the right rule.
+- **Big-M:** artificial variables cost `-M` when maximizing and `+M` when minimizing.
+- **Two-phase:** phase 1 minimizes `r = a1 + a2 + ...` and its row is labelled `r`; phase 2
+  drops the artificial columns and prices out the real objective.
 - Constraints with a negative right-hand side are multiplied by `-1` (flipping `<=`/`>=`).
 - Column order: original variables, then slack/surplus (`s1`, `s2`, ...), then artificial
   (`a1`, `a2`, ...), numbered by constraint.
 
 ## Testing
 
-Besides textbook cases (Hillier & Lieberman, Taha, Beale's cycling example), the test suite
-cross-checks Big-M and two-phase, under both pivot rules, against brute-force vertex
-enumeration on 500 random problems.
+- **Golden tests** pin every tableau of textbook examples (Taha's Big-M and two-phase example,
+  Hillier & Lieberman's Wyndor Glass), so the presentation cannot change silently.
+- **Classic cases:** infeasible, unbounded, redundant equalities, negative right-hand sides,
+  Beale's cycling example.
+- **Oracle:** Big-M and two-phase, under both pivot rules, are cross-checked against
+  brute-force vertex enumeration on 500 random problems, including that the final tableau is
+  optimal under its own sense and shows the real objective value.
 
 ## Roadmap
 

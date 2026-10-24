@@ -1,43 +1,120 @@
+<div align="center">
+
 # simplex-trace
 
-A simplex solver for linear programs that uses **exact rational arithmetic** and records
-**every step** — tableaus, ratio tests, pivots, phase changes — as plain data.
+**An exact-arithmetic simplex solver that shows its work.**
 
-Production solvers (HiGHS, CBC, Gurobi...) give you the answer. `simplex-trace` gives you
-the answer *and how it was reached*, exactly as it is done by hand in an operations research
-course: no `0.9999999`, no hidden iterations.
+Solve linear programs with the primal simplex, Big-M and two-phase methods, and get back
+every tableau, ratio test and pivot as data, plus a full sensitivity analysis.
+
+[![Crates.io](https://img.shields.io/crates/v/simplex-trace.svg?logo=rust)](https://crates.io/crates/simplex-trace)
+[![Docs.rs](https://img.shields.io/docsrs/simplex-trace?logo=docsdotrs)](https://docs.rs/simplex-trace)
+[![CI](https://github.com/angelariasus/simplex-trace/actions/workflows/ci.yml/badge.svg)](https://github.com/angelariasus/simplex-trace/actions/workflows/ci.yml)
+[![Downloads](https://img.shields.io/crates/d/simplex-trace.svg)](https://crates.io/crates/simplex-trace)
+[![MSRV](https://img.shields.io/badge/MSRV-1.85-blue.svg)](#minimum-supported-rust-version)
+[![License](https://img.shields.io/crates/l/simplex-trace.svg)](#license)
+
+[![Rust](https://img.shields.io/badge/Rust-2024_edition-000000?logo=rust&logoColor=white)](https://www.rust-lang.org)
+[![num-rational](https://img.shields.io/badge/arithmetic-num--rational-8A2BE2)](https://crates.io/crates/num-rational)
+[![Serde](https://img.shields.io/badge/serde-optional-E57324)](https://serde.rs)
+[![JSON](https://img.shields.io/badge/JSON-exact_numbers-000000?logo=json&logoColor=white)](#json)
+[![GitHub Actions](https://img.shields.io/badge/GitHub_Actions-CI-2088FF?logo=githubactions&logoColor=white)](https://github.com/angelariasus/simplex-trace/actions)
+[![unsafe forbidden](https://img.shields.io/badge/unsafe-forbidden-success.svg)](https://github.com/rust-secure-code/safety-dance)
+
+</div>
+
+---
+
+## Table of contents
+
+- [Why simplex-trace?](#why-simplex-trace)
+- [Features](#features)
+- [Installation](#installation)
+- [Quick start](#quick-start)
+- [Usage](#usage)
+  - [Building a problem](#building-a-problem)
+  - [Choosing a method](#choosing-a-method)
+  - [Reading the result](#reading-the-result)
+  - [Walking the trace](#walking-the-trace)
+  - [Sensitivity analysis](#sensitivity-analysis)
+  - [JSON](#json)
+- [Conventions](#conventions)
+- [How it is tested](#how-it-is-tested)
+- [Scope and limitations](#scope-and-limitations)
+- [Minimum supported Rust version](#minimum-supported-rust-version)
+- [Roadmap](#roadmap)
+- [Contributing](#contributing)
+- [References](#references)
+- [License](#license)
+
+## Why simplex-trace?
+
+Production solvers such as HiGHS, CBC or Gurobi are built to give you *the answer*, fast,
+in floating point. `simplex-trace` is built to give you the answer **and how it was
+reached**, exactly as the method is taught in an operations research course: no
+`0.9999999`, no hidden iterations.
+
+|                     | Production solvers           | `simplex-trace`                                    |
+| ------------------- | ---------------------------- | -------------------------------------------------- |
+| Arithmetic          | Floating point               | Exact rationals (`1/3`, never `0.333…`)            |
+| Output              | The optimum                  | The optimum **and** every tableau and pivot        |
+| Big-M               | A large numeric `M`, if any  | A symbolic `M` (`7M - 4`), never a guessed value   |
+| Sensitivity         | Floating-point ranges        | Exact ranges, each price linked to a tableau cell  |
+| Built for           | Large real-world models      | Teaching, learning tools, verification             |
+
+Typical uses: step-by-step solvers for students, interactive learning apps, checking
+homework, generating worked examples, and verifying the output of other solvers on small
+problems.
 
 ## Features
 
-- **Methods:** primal simplex, Big-M (with `M` kept symbolic) and two-phase.
-- **Exact arithmetic:** arbitrary-precision rationals (`num-rational`), so tableaus show `1/3`, not `0.333…`.
-- **Full trace:** every tableau snapshot, the entering/leaving variables, the minimum-ratio test,
-  phase 1 results, artificial variables driven out of the basis and redundant rows removed.
-- **Sensitivity analysis** of every optimal solution: shadow prices, reduced costs, and the
-  ranges of right-hand sides and costs that keep the basis optimal, each price linked to the
-  tableau cell it is read from.
-- **Pivot rules:** Dantzig (textbook) or Bland (anti-cycling).
+- **Three methods:** primal simplex, Big-M (with `M` kept symbolic) and two-phase.
+- **Exact arithmetic:** arbitrary-precision rationals, so every tableau matches a hand
+  calculation digit for digit.
+- **Full trace:** every tableau snapshot, the entering and leaving variables, the
+  minimum-ratio test, phase 1 results, artificial variables driven out of the basis and
+  redundant rows removed.
+- **Sensitivity analysis** of every optimal solution: shadow prices, slacks, reduced costs,
+  and the right-hand-side and cost ranges that keep the basis optimal.
 - **Always conclusive:** every method reports optimal, infeasible or unbounded, and the trace
-  says why.
-- **JSON** (optional `serde` feature): problems in, solutions and traces out, with exact numbers.
-- Pure Rust, no I/O, no unsafe.
+  explains why, including a diagnosis when Big-M proves infeasibility.
+- **Pivot rules:** Dantzig (the textbook rule) or Bland (anti-cycling).
+- **Textbook conventions:** tableaus follow Taha's *Operations Research: An Introduction*.
+- **JSON** through the optional `serde` feature, with numbers as exact strings.
+- **Pure library:** no I/O, no `unsafe` (`#![forbid(unsafe_code)]`), three small
+  dependencies from the `num` family.
 
-## Example
+## Installation
+
+```toml
+[dependencies]
+simplex-trace = "0.1"
+
+# Or, to (de)serialize problems, solutions and traces as JSON:
+# simplex-trace = { version = "0.1", features = ["serde"] }
+```
+
+## Quick start
 
 ```rust
-use simplex_trace::{solve, Method, Options, Problem, Relation};
+use simplex_trace::{solve, Method, Options, Problem, Relation, Status, ratio};
 
-// Wyndor Glass Co.: max 3x1 + 5x2
+// Wyndor Glass Co. (Hillier & Lieberman): max 3x1 + 5x2
 let problem = Problem::maximize([3, 5])
     .subject_to([1, 0], Relation::Le, 4)
     .subject_to([0, 2], Relation::Le, 12)
     .subject_to([3, 2], Relation::Le, 18);
 
 let solution = solve(&problem, Method::Simplex, &Options::default()).unwrap();
+
+assert_eq!(
+    solution.status,
+    Status::Optimal { objective: ratio(36, 1), values: vec![ratio(2, 1), ratio(6, 1)] }
+);
 print!("{}", solution.trace);
 ```
 
-Output (`cargo run --example wyndor`):
+The printed trace (`cargo run --example wyndor` also prints the sensitivity report):
 
 ```text
 == simplex, iteration 0 ==
@@ -71,13 +148,137 @@ z     |  0 |  0 |  0 |  3/2 |    1 |  36
 == Optimal ==
 ```
 
-The text output is only a convenience: `solution.trace.steps` is a `Vec<Step>` you can walk
-to render the method in any UI.
+The text rendering is only a convenience: the trace is plain data that you can render in
+any interface.
 
-## Sensitivity analysis
+## Usage
+
+### Building a problem
+
+Coefficients accept integers, `(numerator, denominator)` pairs and `Rational` values, so
+fractions are entered exactly. Variables are named `x1`, `x2`, ... unless you name them.
+
+```rust
+use simplex_trace::{Problem, Rational, Relation};
+
+let half: Rational = "1/2".parse().unwrap();
+
+// min 2/3 chairs + tables
+let problem = Problem::minimize([(2, 3), (1, 1)])
+    .subject_to([1, 1], Relation::Ge, 4)            // chairs + tables >= 4
+    .subject_to([half.clone(), half], Relation::Le, (7, 2))
+    .subject_to([1, -1], Relation::Eq, 0)           // as many chairs as tables
+    .with_names(["chairs", "tables"]);
+
+assert_eq!(problem.num_vars(), 2);
+assert_eq!(problem.var_name(0), "chairs");
+```
+
+All variables are non-negative. Constraints with a negative right-hand side are normalized
+for you.
+
+### Choosing a method
+
+| Method             | Use it for                                                                  |
+| ------------------ | --------------------------------------------------------------------------- |
+| `Method::Simplex`  | Problems whose constraints are all `<=` after normalization, so the slacks give the starting basis. Anything else returns `Error::ArtificialVariablesRequired`. |
+| `Method::BigM`     | Any problem. Artificial variables are penalized with a symbolic `M`.        |
+| `Method::TwoPhase` | Any problem. Phase 1 finds a feasible basis, phase 2 optimizes.             |
+
+```rust
+use simplex_trace::{solve, Error, Method, Options, PivotRule, Problem, Relation};
+
+let problem = Problem::minimize([4, 1])
+    .subject_to([3, 1], Relation::Eq, 3)
+    .subject_to([4, 3], Relation::Ge, 6)
+    .subject_to([1, 2], Relation::Le, 4);
+
+// Bland's rule never cycles; the iteration limit applies per phase.
+let options = Options::default().pivot_rule(PivotRule::Bland).max_iterations(1_000);
+
+assert!(solve(&problem, Method::TwoPhase, &options).is_ok());
+assert!(matches!(
+    solve(&problem, Method::Simplex, &options),
+    Err(Error::ArtificialVariablesRequired)
+));
+```
+
+`solve` only returns an error for a malformed problem, for `Method::Simplex` on a problem
+that needs artificial variables, or when the iteration limit is reached. Infeasible and
+unbounded problems are regular results.
+
+### Reading the result
+
+```rust
+use simplex_trace::{solve, Method, Options, Problem, Relation, Status};
+
+let problem = Problem::maximize([1, 1])
+    .subject_to([1, 1], Relation::Le, 1)
+    .subject_to([1, 1], Relation::Ge, 2);
+let solution = solve(&problem, Method::TwoPhase, &Options::default()).unwrap();
+
+match &solution.status {
+    Status::Optimal { objective, values } => println!("z* = {objective} at {values:?}"),
+    Status::Infeasible => println!("no feasible solution"),
+    Status::Unbounded => println!("the objective can improve without limit"),
+}
+assert_eq!(solution.status, Status::Infeasible);
+```
+
+### Walking the trace
+
+`solution.trace.steps` is a list of steps: tableau snapshots, pivots, phase changes, and a
+final `Finished` step. Each snapshot holds the full tableau (`columns`, `basis`, `rows`,
+`rhs`, and the objective row `z` with its value `z_rhs`).
+
+```rust
+use simplex_trace::{solve, Method, Options, Problem, Relation, Step};
+
+let problem = Problem::minimize([4, 1])
+    .subject_to([3, 1], Relation::Eq, 3)
+    .subject_to([4, 3], Relation::Ge, 6)
+    .subject_to([1, 2], Relation::Le, 4);
+let solution = solve(&problem, Method::BigM, &Options::default()).unwrap();
+
+for step in &solution.trace.steps {
+    match step {
+        Step::Tableau { phase, iteration, snapshot, .. } => {
+            println!("{phase}, iteration {iteration}: z = {}", snapshot.z_rhs);
+        }
+        Step::Pivot { entering_name, leaving_name, pivot_value, .. } => {
+            println!("  {entering_name} enters, {leaving_name} leaves (pivot {pivot_value})");
+        }
+        Step::Finished { termination, .. } => println!("{termination:?}"),
+        _ => {} // other steps; new kinds may be added in minor releases
+    }
+}
+assert_eq!(solution.trace.pivot_count(), 3);
+```
+
+With Big-M, objective values are printed with the symbolic `M`, such as `9M` or `7M - 4`.
+
+### Sensitivity analysis
 
 Every optimal solution comes with `solution.sensitivity`, read from the final basis and
-expressed in terms of the original problem. For Wyndor (`print!("{sensitivity}")`):
+expressed in terms of the original problem, whatever method produced it.
+
+```rust
+use simplex_trace::{solve, Method, Options, Problem, Relation, ratio};
+
+let problem = Problem::maximize([3, 5])
+    .subject_to([1, 0], Relation::Le, 4)
+    .subject_to([0, 2], Relation::Le, 12)
+    .subject_to([3, 2], Relation::Le, 18);
+let solution = solve(&problem, Method::Simplex, &Options::default()).unwrap();
+let s = solution.sensitivity.as_ref().unwrap();
+
+// One more unit of resource 2 is worth 3/2, while b2 stays within [6, 18].
+assert_eq!(s.constraints[1].shadow_price, ratio(3, 2));
+assert_eq!(s.constraints[1].rhs_range.to_string(), "[6, 18]");
+// (2, 6) stays optimal while c1 is within [0, 15/2].
+assert_eq!(s.variables[0].cost_range.to_string(), "[0, 15/2]");
+print!("{s}");
+```
 
 ```text
 constraint | shadow price | slack | rhs range | read from
@@ -92,122 +293,177 @@ x1       |     2 |            0 |  [0, 15/2]
 x2       |     6 |            0 |  [2, +inf)
 ```
 
-- **Shadow price** `y_i = dz*/db_i`: how much the optimal objective changes per unit increase
-  of `b_i`, while `b_i` stays within its **rhs range**. This is the rate of change of `z`
-  itself, as in Hillier & Lieberman and Excel, also when minimizing (LINDO's "dual price" is
-  the improvement: the same when maximizing, negated when minimizing).
-- **Cost range:** the values of `c_j` for which the current solution stays optimal.
-- **Reduced cost:** `z_j - c_j` in the final tableau.
-- **Read from:** the objective-row cell that holds the price: under the slack (`<=`), the
-  negated surplus (`>=`) or, with Big-M, the artificial variable (`=`, constant part only).
-  The two-phase method drops artificial columns, so its equalities show `computed`.
-- `degenerate` and `alternative_optima` flag the cases where prices are one-sided or other
-  optima exist. Redundant equalities get a zero price, and they and the equalities they depend
-  on get a single-point rhs range (none can move alone).
-- With Big-M an artificial variable can be left in the basis at zero. The analysis then comes
-  from an equivalent optimal basis of the real problem (same solution, reached by degenerate
+| Field          | Meaning                                                                    |
+| -------------- | -------------------------------------------------------------------------- |
+| `shadow_price` | `dz*/db_i`: the change of the optimal objective per unit increase of `b_i`. This is the rate of change of `z` itself, as in Hillier & Lieberman and Excel, also when minimizing. LINDO's "dual price" is the improvement instead: the same value when maximizing, negated when minimizing. |
+| `rhs_range`    | The values of `b_i` for which the basis, and so the shadow prices, stay valid. |
+| `cost_range`   | The values of `c_j` for which the current solution stays optimal.          |
+| `reduced_cost` | `z_j - c_j` in the final tableau.                                          |
+| `source`       | The objective-row cell the price is read from: under the slack (`<=`), under the surplus negated (`>=`), or with Big-M the constant part under the artificial variable (`=`). |
+
+Edge cases are reported, not hidden:
+
+- `degenerate` and `alternative_optima` flag one-sided prices and the existence of other
+  optima.
+- Redundant equalities get a zero price. They, and the equalities they depend on, get a
+  single-point right-hand-side range, because none of them can move alone.
+- The two-phase method drops artificial columns, so its equalities have no `source`.
+- Big-M can leave an artificial variable in the basis at zero. The analysis then comes from
+  an equivalent optimal basis of the real problem (the same solution, reached by degenerate
   pivots), and `from_final_tableau` is `false`.
 
-## JSON
+### JSON
 
-Enable the `serde` feature to send problems from a front end and get the whole trace back:
+With the `serde` feature, problems, solutions, traces and sensitivity reports are
+serializable. Numbers are always **exact strings** (`"3"`, `"-1/2"`); JSON floats are
+rejected, so nothing is ever rounded on the way to or from a front end.
 
-```toml
-simplex-trace = { version = "0.1", features = ["serde"] }
+```rust,ignore
+use simplex_trace::{solve, Method, Options, Problem};
+
+let problem: Problem = serde_json::from_str(r#"{
+    "sense": "minimize",
+    "objective": ["4", "1"],
+    "constraints": [
+        { "coeffs": ["3", "1"], "relation": "=",  "rhs": "3" },
+        { "coeffs": ["4", "3"], "relation": ">=", "rhs": "6" },
+        { "coeffs": ["1", "2"], "relation": "<=", "rhs": "4" }
+    ]
+}"#)?;
+
+let solution = solve(&problem, Method::BigM, &Options::default())?;
+println!("{}", serde_json::to_string_pretty(&solution)?);
 ```
 
-Numbers are always **exact strings** (`"3"`, `"-1/2"`); JSON floats are rejected, so nothing
-is ever rounded. A problem (`var_names` is optional):
+The status sits at the top level, next to the sensitivity report and the trace:
 
 ```json
 {
-  "sense": "minimize",
-  "objective": ["4", "1"],
-  "constraints": [
-    { "coeffs": ["3", "1"], "relation": "=", "rhs": "3" },
-    { "coeffs": ["4", "3"], "relation": ">=", "rhs": "6" },
-    { "coeffs": ["1", "2"], "relation": "<=", "rhs": "4" }
-  ]
+  "status": "optimal",
+  "objective": "17/5",
+  "values": ["2/5", "9/5"],
+  "sensitivity": { "basic_variables": ["..."], "constraints": ["..."], "variables": ["..."] },
+  "trace": { "sense": "minimize", "steps": ["..."] }
 }
 ```
 
-A solution carries its status at the top level, next to the trace. Each step has a
-`"type"`; values that may contain the symbolic `M` are `{"m": "7", "c": "-4"}` (that is,
-`7M - 4`):
+Every step has a `"type"`. Values that may contain the symbolic `M` are objects such as
+`{"m": "7", "c": "-4"}`, meaning `7M - 4`:
 
 ```json
-{ "status": "optimal", "objective": "17/5", "values": ["2/5", "9/5"],
-  "sensitivity": { "basic_variables": [...], "constraints": [...], "variables": [...], ... },
-  "trace": { "sense": "minimize", "steps": [ ... ] } }
-
-{ "status": "infeasible", "trace": { ... } }
-
-{ "type": "pivot", "phase": "single", "iteration": 0,
-  "entering": 0, "entering_name": "x1", "leaving_row": 0, "leaving": 4, "leaving_name": "a1",
+{
+  "type": "pivot", "phase": "single", "iteration": 0,
+  "entering": 0, "entering_name": "x1",
+  "leaving_row": 0, "leaving": 4, "leaving_name": "a1",
   "pivot_value": "3",
-  "ratios": [{ "row": 0, "ratio": "1" }, { "row": 1, "ratio": "3/2" }, { "row": 2, "ratio": "4" }] }
-
-{ "type": "finished", "termination": "optimal" }
-
-{ "shadow_price": "3/2", "slack": "0", "binding": true,
-  "rhs_range": { "lower": "6", "upper": "18" }, "redundant": false,
-  "source": { "column": 3, "name": "s2", "negated": false } }
+  "ratios": [{ "row": 0, "ratio": "1" }, { "row": 1, "ratio": "3/2" }, { "row": 2, "ratio": "4" }]
+}
 ```
 
-Infinite range ends are `null`. The last object is one entry of `sensitivity.constraints`.
-
-Step types: `tableau`, `pivot`, `phase_one_finished`, `artificial_pivoted_out`,
-`redundant_row_removed`, `artificial_remains_positive`, `finished`. New types may appear in
-minor releases, so a UI should skip unknown ones. See `cargo run --example json --features serde`
-for a full trace.
+Step types are `tableau`, `pivot`, `phase_one_finished`, `artificial_pivoted_out`,
+`redundant_row_removed`, `artificial_remains_positive` and `finished`. New types may appear
+in minor releases, so a client should skip types it does not know. Infinite range ends are
+`null`. Run `cargo run --example json --features serde` to see a complete solution.
 
 ## Conventions
 
-Tableaus follow the convention of Taha's *Operations Research: An Introduction*, so they
-match the textbook line by line:
+Tableaus follow Taha's *Operations Research: An Introduction*, so they match the textbook
+line by line:
 
-- All variables are non-negative.
 - The problem is never silently converted: the objective row holds `z_j - c_j` with the real
   costs, and its right-hand side is the real objective value.
-- **Maximize:** the most negative `z_j - c_j` enters; optimal when all are `>= 0`.
-  **Minimize:** the most positive enters; optimal when all are `<= 0`.
-  `Snapshot::is_optimal` applies the right rule.
+- **Maximize:** the most negative `z_j - c_j` enters, and the tableau is optimal when all are
+  `>= 0`. **Minimize:** the most positive enters, and it is optimal when all are `<= 0`.
+- **Ties:** the entering column with the lowest index wins; in the ratio test, the row whose
+  basic variable has the lowest index.
 - **Big-M:** artificial variables cost `-M` when maximizing and `+M` when minimizing. The `M`
-  part of the objective row is improved first (both pivot rules), so when the run stops — at an
-  optimal tableau or at an unbounded direction — the penalty cannot improve any further. If an
-  artificial variable is still positive at that point the problem is infeasible, and the trace
-  records it as `Step::ArtificialRemainsPositive`.
-- **Two-phase:** phase 1 minimizes `r = a1 + a2 + ...` and its row is labelled `r`; phase 2
-  drops the artificial columns and prices out the real objective.
-- Constraints with a negative right-hand side are multiplied by `-1` (flipping `<=`/`>=`).
-- Column order: original variables, then slack/surplus (`s1`, `s2`, ...), then artificial
-  (`a1`, `a2`, ...), numbered by constraint.
+  part of the objective row is improved first, so when the run stops the penalty cannot
+  improve any further. An artificial variable that is still positive then proves the problem
+  infeasible, and the trace records it.
+- **Two-phase:** phase 1 minimizes `r = a1 + a2 + ...` in a row labelled `r`; phase 2 drops the
+  artificial columns and prices out the real objective.
+- **Columns:** original variables, then slack and surplus (`s1`, `s2`, ...), then artificial
+  variables (`a1`, `a2`, ...), numbered by constraint.
 
-## Testing
+## How it is tested
 
-- **Golden tests** pin every tableau of textbook examples (Taha's Big-M and two-phase example,
-  Hillier & Lieberman's Wyndor Glass), so the presentation cannot change silently.
-- **Classic cases:** infeasible, unbounded, redundant equalities, negative right-hand sides,
-  Beale's cycling example.
-- **Oracle:** plain simplex, Big-M and two-phase, under both pivot rules, are cross-checked against
-  brute-force vertex enumeration on 600 random problems (optimal, infeasible, unbounded,
-  degenerate and redundant). Every recorded step is checked too: non-negative right-hand sides,
-  unit basic columns, the entering column chosen by the pivot rule, the minimum-ratio leaving row,
-  and that the final tableau is optimal under its own sense and shows the real objective value.
-- **Sensitivity:** textbook values (Wyndor, Taha), negative right-hand sides, redundant
-  equalities, degenerate Big-M bases. In the oracle, every report is checked for strong
-  duality, complementary slackness, dual feasibility and agreement with the final tableau,
-  and every range is probed by brute force: at its ends the objective must follow the
-  claimed slope, and just beyond them the basis must stop being optimal.
-- **JSON contract** (`--features serde`): exact round trips, and the shape of problems,
-  statuses and steps is pinned by tests.
+Correctness matters more than speed in a teaching tool, so every claim is checked against
+an independent source:
+
+- **Golden tests** pin every tableau of textbook examples (Taha's Big-M and two-phase
+  example, Hillier & Lieberman's Wyndor Glass), so the presentation cannot change silently.
+- **Brute-force oracle:** all three methods, under both pivot rules, are compared with exact
+  vertex enumeration on 600 random problems: optimal, infeasible, unbounded, degenerate and
+  redundant. Every recorded step is checked too: non-negative right-hand sides, unit basic
+  columns, the entering column chosen by the rule and the minimum-ratio leaving row.
+- **Sensitivity oracle:** every report is checked for strong duality, complementary slackness,
+  dual feasibility and agreement with the final tableau. Every range is probed by brute force:
+  at its ends the objective must follow the claimed slope, and just beyond them the basis
+  must stop being optimal.
+- **Classic cases:** infeasible, unbounded, redundant equalities, negative right-hand sides
+  and Beale's cycling example.
+- **JSON contract:** exact round trips, and the shape of every object is pinned by tests.
+- **Mutation checks:** deliberately injected bugs (wrong ratio test, wrong pivot rule, wrong
+  signs or ranges) are confirmed to make the suite fail.
+- **README examples** are compiled and run as doctests.
+- **CI** runs formatting, Clippy, documentation and all tests on stable and on the minimum
+  supported Rust version, with and without the `serde` feature.
+
+## Scope and limitations
+
+- Exact arithmetic is much slower than floating point, and the full trace stores a copy of
+  every tableau. The crate is meant for problems of classroom size (up to a few dozen
+  variables and constraints), not for large models.
+- All variables must be non-negative. Free variables are on the roadmap; until then, split a
+  free variable as `x = x' - x''`.
+- Integer programming is out of scope.
+
+## Minimum supported Rust version
+
+The MSRV is **Rust 1.85**, the first release with the 2024 edition, and it is checked in CI.
+It will only be raised in a minor release, with a note in the [changelog](CHANGELOG.md).
 
 ## Roadmap
 
-- Dual simplex, and with it adding a constraint or a variable after the optimum
-- Free (unrestricted-sign) variables
+- [x] Primal simplex, Big-M and two-phase methods with a full trace
+- [x] Sensitivity analysis
+- [x] JSON support
+- [ ] Dual simplex, and with it adding a constraint or a variable after the optimum
+- [ ] Free (unrestricted-sign) variables
+
+## Contributing
+
+Issues and pull requests are welcome. Before opening a pull request, please run:
+
+```sh
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-features
+```
+
+Commit messages follow [Conventional Commits](https://www.conventionalcommits.org). For a
+change to the solver, a test against a worked textbook example or the brute-force oracle is
+the most convincing evidence.
+
+## References
+
+- Hamdy A. Taha, *Operations Research: An Introduction*. Tableau conventions, and the Big-M
+  and two-phase examples.
+- Frederick S. Hillier and Gerald J. Lieberman, *Introduction to Operations Research*. The
+  Wyndor Glass Co. example and the shadow-price convention.
+- E. M. L. Beale, "Cycling in the dual simplex algorithm", *Naval Research Logistics
+  Quarterly*, 1955. The cycling example used to test Bland's rule.
 
 ## License
 
-Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
-[MIT license](LICENSE-MIT) at your option.
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or
+  <https://www.apache.org/licenses/LICENSE-2.0>)
+- MIT license ([LICENSE-MIT](LICENSE-MIT) or <https://opensource.org/licenses/MIT>)
+
+at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for
+inclusion in the work by you, as defined in the Apache-2.0 license, shall be dual licensed as
+above, without any additional terms or conditions.

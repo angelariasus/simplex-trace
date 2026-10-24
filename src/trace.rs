@@ -113,6 +113,14 @@ pub enum Step {
     },
     /// A row whose basic variable was artificial and had no usable column: it was redundant.
     RedundantRowRemoved { row: usize },
+    /// Big-M: the penalty row (`M` part) can no longer improve, yet some artificial variables
+    /// are still positive, so the problem is infeasible. `unbounded_direction` is `true` when
+    /// the run stopped at an unbounded direction rather than at an optimal tableau.
+    ArtificialRemainsPositive {
+        /// `(name, value)` of each positive artificial variable.
+        artificials: Vec<(String, Rational)>,
+        unbounded_direction: bool,
+    },
     /// Final outcome.
     Finished(Termination),
 }
@@ -262,6 +270,29 @@ impl fmt::Display for Trace {
                 }
                 Step::RedundantRowRemoved { row } => {
                     writeln!(f, "-> row {} is redundant and was removed", row + 1)?;
+                }
+                Step::ArtificialRemainsPositive {
+                    artificials,
+                    unbounded_direction,
+                } => {
+                    let list: Vec<String> = artificials
+                        .iter()
+                        .map(|(name, value)| format!("{name} = {value}"))
+                        .collect();
+                    let stop = if *unbounded_direction {
+                        "an unbounded direction was found"
+                    } else {
+                        "the tableau is optimal"
+                    };
+                    writeln!(
+                        f,
+                        "-> {stop}, but the M row cannot improve and {} still positive: no feasible solution",
+                        if list.len() == 1 {
+                            format!("{} is", list[0])
+                        } else {
+                            format!("{} are", list.join(", "))
+                        }
+                    )?;
                 }
                 Step::Finished(t) => writeln!(f, "== {t:?} ==")?,
             }

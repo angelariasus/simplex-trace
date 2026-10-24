@@ -311,15 +311,28 @@ impl Tableau {
 
     /// Maximizing: a column improves when `z_j - c_j < 0`, Dantzig picks the most negative.
     /// Minimizing: when `z_j - c_j > 0`, Dantzig picks the most positive.
+    ///
+    /// With Big-M the comparison is lexicographic: the `M` part (the penalty on artificials)
+    /// is improved first, the real objective only once the penalty cannot improve. Dantzig
+    /// gets this from the ordering of [`Coef`]; Bland picks the lowest-index column that
+    /// improves the `M` part, and only if none does, the lowest-index column that improves
+    /// the constant part. That is Bland applied to two problems in sequence (the `M` row does
+    /// not change while columns with no `M` part enter), so it still cannot cycle.
     fn entering(&self, rule: PivotRule) -> Option<usize> {
         let sense = self.sense;
         let improves = |j: &usize| match sense {
             Sense::Maximize => self.z[*j].is_negative(),
             Sense::Minimize => self.z[*j].is_positive(),
         };
+        let improves_penalty = |j: &usize| match sense {
+            Sense::Maximize => self.z[*j].m.is_negative(),
+            Sense::Minimize => self.z[*j].m.is_positive(),
+        };
         let mut candidates = (0..self.z.len()).filter(improves);
         match rule {
-            PivotRule::Bland => candidates.next(),
+            PivotRule::Bland => (0..self.z.len())
+                .find(improves_penalty)
+                .or_else(|| candidates.next()),
             // `min_by` keeps the first of equal elements, so ties go to the lowest index.
             PivotRule::Dantzig => candidates.min_by(|&a, &b| match sense {
                 Sense::Maximize => self.z[a].cmp(&self.z[b]),
@@ -392,8 +405,12 @@ impl Tableau {
         }
     }
 
-    fn positive_artificial_in_basis(&self) -> bool {
-        (0..self.rows.len()).any(|i| self.artificial[self.basis[i]] && self.rhs[i].is_positive())
+    /// Basic artificial variables with a positive value, as `(name, value)`.
+    fn positive_artificials(&self) -> Vec<(String, Rational)> {
+        (0..self.rows.len())
+            .filter(|&i| self.artificial[self.basis[i]] && self.rhs[i].is_positive())
+            .map(|i| (self.names[self.basis[i]].clone(), self.rhs[i].clone()))
+            .collect()
     }
 
     /// Plain simplex (`artificial_cost == 0`, no artificials present) or Big-M (`∓M`).
@@ -406,11 +423,22 @@ impl Tableau {
         trace: &mut Trace,
     ) -> Result<End, Error> {
         self.set_objective(sense, "z", costs, &artificial_cost);
-        match self.optimize(Phase::Single, options, trace)? {
-            End::Optimal if self.positive_artificial_in_basis() => Ok(End::Infeasible),
-            End::Unbounded if self.positive_artificial_in_basis() => Err(Error::Inconclusive),
-            end => Ok(end),
+        let end = self.optimize(Phase::Single, options, trace)?;
+
+        // Big-M stops in two ways: an optimal tableau, or an unbounded direction. The entering
+        // column of an unbounded direction cannot improve the `M` part (the penalty is
+        // bounded), and columns that improve the `M` part always enter first. So in both cases
+        // the penalty can no longer improve: the sum of artificials is at its minimum. If an
+        // artificial is still positive, no feasible point exists.
+        let positive = self.positive_artificials();
+        if positive.is_empty() {
+            return Ok(end);
         }
+        trace.push(Step::ArtificialRemainsPositive {
+            artificials: positive,
+            unbounded_direction: matches!(end, End::Unbounded),
+        });
+        Ok(End::Infeasible)
     }
 
     fn two_phase(

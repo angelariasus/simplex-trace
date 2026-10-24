@@ -13,9 +13,6 @@ pub enum Error {
     ArtificialVariablesRequired,
     /// The iteration limit in [`Options`](crate::Options) was reached (possible cycling).
     IterationLimit(usize),
-    /// Big-M found an unbounded direction while an artificial variable was still positive,
-    /// so it cannot tell whether the original problem is feasible. Use `TwoPhase`.
-    Inconclusive,
 }
 
 impl fmt::Display for Error {
@@ -27,10 +24,6 @@ impl fmt::Display for Error {
                 "this problem needs artificial variables; use Method::BigM or Method::TwoPhase"
             ),
             Error::IterationLimit(n) => write!(f, "iteration limit of {n} reached"),
-            Error::Inconclusive => write!(
-                f,
-                "Big-M is inconclusive for this problem (unbounded direction with a positive artificial variable); use Method::TwoPhase"
-            ),
         }
     }
 }

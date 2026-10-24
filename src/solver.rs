@@ -20,9 +20,10 @@ pub enum Method {
 /// Rule for choosing the entering column.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PivotRule {
-    /// Most negative reduced cost (the textbook rule). Ties go to the lowest column index.
+    /// The textbook rule: the most negative `z_j - c_j` when maximizing, the most positive
+    /// when minimizing. Ties go to the lowest column index.
     Dantzig,
-    /// Lowest-index negative reduced cost. Slower, but never cycles.
+    /// The lowest-index column that improves the objective. Slower, but never cycles.
     Bland,
 }
 
@@ -83,31 +84,31 @@ pub fn solve(problem: &Problem, method: Method, options: &Options) -> Result<Sol
     problem.validate()?;
     let mut trace = Trace::new(problem.sense);
     let mut t = Tableau::standard_form(problem);
-    let costs = internal_costs(problem);
+    let sense = problem.sense;
+    let costs = &problem.objective;
 
     let status = match method {
         Method::Simplex if t.has_artificials() => return Err(Error::ArtificialVariablesRequired),
-        Method::Simplex => t.single_phase(&costs, Coef::zero(), options, &mut trace)?,
+        Method::Simplex => t.single_phase(sense, costs, Coef::zero(), options, &mut trace)?,
         Method::TwoPhase if !t.has_artificials() => {
-            t.single_phase(&costs, Coef::zero(), options, &mut trace)?
+            t.single_phase(sense, costs, Coef::zero(), options, &mut trace)?
         }
-        Method::TwoPhase => t.two_phase(&costs, options, &mut trace)?,
+        Method::TwoPhase => t.two_phase(sense, costs, options, &mut trace)?,
         Method::BigM => {
-            let penalty = Coef::big_m(-Rational::one());
-            t.single_phase(&costs, penalty, options, &mut trace)?
+            // The penalty always works against the objective: -M when maximizing, +M when minimizing.
+            let penalty = match sense {
+                Sense::Maximize => Coef::big_m(-Rational::one()),
+                Sense::Minimize => Coef::big_m(Rational::one()),
+            };
+            t.single_phase(sense, costs, penalty, options, &mut trace)?
         }
     };
 
     let status = match status {
         End::Optimal => {
-            let internal = t.z_rhs.c.clone();
-            let objective = match problem.sense {
-                Sense::Maximize => internal,
-                Sense::Minimize => -internal,
-            };
             trace.push(Step::Finished(Termination::Optimal));
             Status::Optimal {
-                objective,
+                objective: t.z_rhs.c.clone(),
                 values: t.values(problem.num_vars()),
             }
         }
@@ -123,14 +124,6 @@ pub fn solve(problem: &Problem, method: Method, options: &Options) -> Result<Sol
     Ok(Solution { status, trace })
 }
 
-/// Objective coefficients of the equivalent maximization.
-fn internal_costs(problem: &Problem) -> Vec<Rational> {
-    match problem.sense {
-        Sense::Maximize => problem.objective.clone(),
-        Sense::Minimize => problem.objective.iter().map(|c| -c.clone()).collect(),
-    }
-}
-
 enum End {
     Optimal,
     Infeasible,
@@ -138,6 +131,9 @@ enum End {
 }
 
 struct Tableau {
+    /// Sense of the objective currently in the `z` row (phase 1 is always `Minimize`).
+    sense: Sense,
+    objective_label: &'static str,
     names: Vec<String>,
     artificial: Vec<bool>,
     rows: Vec<Vec<Rational>>,
@@ -218,6 +214,8 @@ impl Tableau {
         }
 
         Tableau {
+            sense: problem.sense,
+            objective_label: "z",
             artificial: (0..width).map(|j| j >= first_artificial).collect(),
             names,
             rows,
@@ -234,6 +232,8 @@ impl Tableau {
 
     fn snapshot(&self) -> Snapshot {
         Snapshot {
+            sense: self.sense,
+            objective_label: self.objective_label.to_string(),
             columns: self.names.clone(),
             basis: self.basis.clone(),
             rows: self.rows.clone(),
@@ -243,10 +243,18 @@ impl Tableau {
         }
     }
 
-    /// Sets the objective row to `z_j - c_j` for maximization costs `costs` (original
-    /// variables; slack/surplus cost 0, artificials cost `artificial_cost`), then prices out
-    /// the basic columns so the row is consistent with the current basis.
-    fn set_objective(&mut self, costs: &[Rational], artificial_cost: &Coef) {
+    /// Sets the objective row to `z_j - c_j` for the objective `sense` with costs `costs`
+    /// (original variables; slack/surplus cost 0, artificials cost `artificial_cost`), then
+    /// prices out the basic columns so the row is consistent with the current basis.
+    fn set_objective(
+        &mut self,
+        sense: Sense,
+        label: &'static str,
+        costs: &[Rational],
+        artificial_cost: &Coef,
+    ) {
+        self.sense = sense;
+        self.objective_label = label;
         self.z = (0..self.names.len())
             .map(|j| {
                 if j < costs.len() {
@@ -301,12 +309,22 @@ impl Tableau {
         self.basis[row] = col;
     }
 
+    /// Maximizing: a column improves when `z_j - c_j < 0`, Dantzig picks the most negative.
+    /// Minimizing: when `z_j - c_j > 0`, Dantzig picks the most positive.
     fn entering(&self, rule: PivotRule) -> Option<usize> {
-        let mut candidates = (0..self.z.len()).filter(|&j| self.z[j].is_negative());
+        let sense = self.sense;
+        let improves = |j: &usize| match sense {
+            Sense::Maximize => self.z[*j].is_negative(),
+            Sense::Minimize => self.z[*j].is_positive(),
+        };
+        let mut candidates = (0..self.z.len()).filter(improves);
         match rule {
             PivotRule::Bland => candidates.next(),
             // `min_by` keeps the first of equal elements, so ties go to the lowest index.
-            PivotRule::Dantzig => candidates.min_by(|&a, &b| self.z[a].cmp(&self.z[b])),
+            PivotRule::Dantzig => candidates.min_by(|&a, &b| match sense {
+                Sense::Maximize => self.z[a].cmp(&self.z[b]),
+                Sense::Minimize => self.z[b].cmp(&self.z[a]),
+            }),
         }
     }
 
@@ -378,15 +396,16 @@ impl Tableau {
         (0..self.rows.len()).any(|i| self.artificial[self.basis[i]] && self.rhs[i].is_positive())
     }
 
-    /// Plain simplex (`artificial_cost == 0`, no artificials present) or Big-M (`-M`).
+    /// Plain simplex (`artificial_cost == 0`, no artificials present) or Big-M (`∓M`).
     fn single_phase(
         &mut self,
+        sense: Sense,
         costs: &[Rational],
         artificial_cost: Coef,
         options: &Options,
         trace: &mut Trace,
     ) -> Result<End, Error> {
-        self.set_objective(costs, &artificial_cost);
+        self.set_objective(sense, "z", costs, &artificial_cost);
         match self.optimize(Phase::Single, options, trace)? {
             End::Optimal if self.positive_artificial_in_basis() => Ok(End::Infeasible),
             End::Unbounded if self.positive_artificial_in_basis() => Err(Error::Inconclusive),
@@ -396,17 +415,23 @@ impl Tableau {
 
     fn two_phase(
         &mut self,
+        sense: Sense,
         costs: &[Rational],
         options: &Options,
         trace: &mut Trace,
     ) -> Result<End, Error> {
-        // Phase 1: maximize -(sum of artificials), i.e. each artificial costs -1.
+        // Phase 1: minimize r = sum of artificials (each artificial costs 1, the rest 0).
         let zeros = vec![Rational::zero(); costs.len()];
-        self.set_objective(&zeros, &Coef::constant(-Rational::one()));
-        // Phase 1 is bounded below by 0, so it always ends optimal.
+        self.set_objective(
+            Sense::Minimize,
+            "r",
+            &zeros,
+            &Coef::constant(Rational::one()),
+        );
+        // r is bounded below by 0, so phase 1 always ends optimal.
         self.optimize(Phase::One, options, trace)?;
 
-        let artificial_sum = -self.z_rhs.c.clone();
+        let artificial_sum = self.z_rhs.c.clone();
         let feasible = artificial_sum.is_zero();
         trace.push(Step::PhaseOneFinished {
             artificial_sum,
@@ -417,7 +442,7 @@ impl Tableau {
         }
 
         self.drop_artificials(trace);
-        self.set_objective(costs, &Coef::zero());
+        self.set_objective(sense, "z", costs, &Coef::zero());
         self.optimize(Phase::Two, options, trace)
     }
 

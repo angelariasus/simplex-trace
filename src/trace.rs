@@ -26,11 +26,18 @@ impl fmt::Display for Phase {
 
 /// A full copy of the tableau at one point in time.
 ///
-/// The objective row holds `z_j - c_j` for the equivalent *maximization* problem (for a
-/// minimization, the objective is negated internally, so `z_rhs` is `-(c·x)`). A tableau is
-/// optimal when no entry of `z` is negative.
+/// The tableau is always expressed in the sense of the objective being optimized, as in
+/// Taha's textbook: the objective row holds `z_j - c_j` with the real costs `c_j`, and
+/// `z_rhs` is the real objective value. A maximization tableau is optimal when every
+/// `z_j - c_j >= 0`; a minimization tableau when every `z_j - c_j <= 0` (see
+/// [`Snapshot::is_optimal`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Snapshot {
+    /// Sense of the objective in this tableau. Phase 1 of the two-phase method is always
+    /// [`Sense::Minimize`] (it minimizes `r`, the sum of the artificial variables).
+    pub sense: Sense,
+    /// Name of the objective row: `"z"`, or `"r"` in phase 1 of the two-phase method.
+    pub objective_label: String,
     /// Column names (original variables, then slack/surplus, then artificial).
     pub columns: Vec<String>,
     /// For each constraint row, the index of its basic column.
@@ -41,8 +48,19 @@ pub struct Snapshot {
     pub rhs: Vec<Rational>,
     /// Objective row, `z_j - c_j` per column (may contain the symbolic `M`).
     pub z: Vec<Coef>,
-    /// Current objective value of the equivalent maximization.
+    /// Current value of the objective (may contain the symbolic `M` in Big-M).
     pub z_rhs: Coef,
+}
+
+impl Snapshot {
+    /// `true` when no column can improve the objective: all `z_j - c_j >= 0` when
+    /// maximizing, all `<= 0` when minimizing.
+    pub fn is_optimal(&self) -> bool {
+        match self.sense {
+            Sense::Maximize => !self.z.iter().any(Coef::is_negative),
+            Sense::Minimize => !self.z.iter().any(Coef::is_positive),
+        }
+    }
 }
 
 /// One entry of the minimum-ratio test.
@@ -151,7 +169,7 @@ impl fmt::Display for Snapshot {
             table.push(line);
         }
 
-        let mut z_line = vec!["z".to_string()];
+        let mut z_line = vec![self.objective_label.clone()];
         z_line.extend(self.z.iter().map(|v| v.to_string()));
         z_line.push(self.z_rhs.to_string());
         table.push(z_line);

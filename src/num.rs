@@ -87,6 +87,14 @@ impl Coef {
         }
     }
 
+    pub fn is_positive(&self) -> bool {
+        match self.m.cmp(&Rational::zero()) {
+            Ordering::Greater => true,
+            Ordering::Less => false,
+            Ordering::Equal => self.c.is_positive(),
+        }
+    }
+
     /// `self -= f * r`
     pub(crate) fn sub_mul(&mut self, f: &Coef, r: &Rational) {
         self.m -= &f.m * r;

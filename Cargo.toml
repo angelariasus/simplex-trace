@@ -1,0 +1,13 @@
+[package]
+name = "simplex-trace"
+version = "0.1.0"
+edition = "2024"
+description = "Exact-arithmetic simplex (primal, Big-M, two-phase) that records every tableau and pivot as data."
+license = "MIT OR Apache-2.0"
+keywords = ["simplex", "linear-programming", "optimization", "education", "exact"]
+categories = ["mathematics", "science", "algorithms"]
+
+[dependencies]
+num-bigint = "0.4"
+num-rational = "0.4"
+num-traits = "0.2"
